@@ -1,0 +1,300 @@
+import io
+import codecs
+from math import ceil, log
+
+def binstring_decode(binstring,errors=None):
+    byte_data = []
+    for i in range(0,len(binstring),8):
+        byte_data.append(int(binstring[i:i+8],2))
+    return bytes(byte_data)
+
+def binstring_encode(bytes_data,errors=None):
+    """
+    >>> b = binstring_encode('hello world')
+    >>> b
+    b'0110100001100101011011000110110001101111001000000111011101101111011100100110110001100100'
+    >>> binstring_decode(b)
+    b'hello world'
+    """
+    if isinstance(bytes_data,str):
+        bytes_data = bytes_data.encode()
+    s_data = []
+    for value in bytes_data:
+        s_data.append(bin(value)[2:].encode().zfill(8))
+    return b''.join(s_data)
+class StreamReader_binstring(codecs.StreamReader):
+    def __init__(self,stream,errors='strict'):
+        super(StreamReader_binstring,self).__init__(stream,errors)
+        self.stream = stream
+    def read(self,size=None,chars=None,firstline=None):
+        return binstring_decode(self.stream.read(size))
+
+
+class StreamWriter_binstring(codecs.StreamWriter):
+    def __init__(self,stream,errors='strict'):
+        super(StreamWriter_binstring,self).__init__(stream,errors)
+        self.stream = stream
+    def write(self,b):
+        self.stream.write(binstring_encode(b))
+    def reset(self):
+        self.stream.flush()
+
+
+def codec_search_function(codec_name):
+    if codec_name == 'binstring' or codec_name == 'binstring_codec':
+        return codecs.CodecInfo(encode=binstring_encode,decode=binstring_decode,streamwriter=StreamWriter_binstring,streamreader=StreamReader_binstring)
+codecs.register(codec_search_function)
+
+def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
+    """
+    >>> bytes_to_uint(b'hello world')
+    126207244316550804821666916
+    """
+    byte_data = list(byte_data)
+    n = len(byte_data)
+    if invert:
+        byte_data = [invert_byte_table[value] for value in byte_data]
+    if lstrip != 0:
+        byte_data[0] = rmask_byte(8-lstrip,byte_data[0])
+    if rstrip != 0:
+        byte_data[-1] = lmask_byte(8-rstrip,byte_data[-1])
+    if reverse:
+        byte_data =[reverse_byte_table[value] for value in byte_data[::-1]]
+    return sum((b<<(8*(n-p-1))) for p,b in enumerate(byte_data))
+
+def uint_to_bytes(uint,num_bits=None,loffset=0,lvalue=0,rvalue=0,reverse=False,invert=False):
+    if not isinstance(uint,int):
+        raise Exception('input must be an integer, not %s' % repr(type(value)))
+    if value < 0:
+        raise Exception('input must be non-negative: %s' % repr(value))
+    extracted_bits = 0
+    byte_data = []
+    while (num_bits is not None and extracted_bits < num_bits) or uint > 0:
+        uint,value = divmod(uint,8)
+        extracted_bits += 8
+        if num_bits is not None and extracted_bits > num_bits:
+            extra_bits = extracted_bits - num_bits
+            keep_bits = 8 - extra_bits
+            value = rmask_byte(keep_bits,value)
+        byte_data.append(value)
+    if reverse:
+        byte_data =[reverse_byte_table[value] for value in byte_data[::-1]]
+    if invert:
+        byte_data = [invert_byte_table[value] for value in byte_data]
+    if loffset > 0:
+        first_byte_rmask = 8-loffset
+        byte_data[-1] = rmask_byte(first_byte_rmask,byte_data[-1]) | lmask_byte(loffset,lvalue)
+    last_byte_lmask = ((loffset + num_bits)%8)
+    roffset = 8 - last_byte_lmask
+    if roffset > 0:
+        byte_data[0] = lmask_byte(last_byte_lmask,byte_data[0]) | rmask_byte(roffset,rvalue)
+    return bytes(byte_data[::-1])
+
+def min_bits_uint(value):
+    return int(ceil(log(value,2)))
+
+def invert_uint(value,num_bits=None):
+    if not isinstance(value,int):
+        raise Exception('input must be an integer, not %s' % repr(type(value)))
+    if value < 0:
+        raise Exception('input must be non-negative: %s' % repr(value))
+    if num_bits is None:
+        num_bits = min_bits_uint(value)
+    return value ^ ((1<<num_bits)-1)
+
+
+def reverse_uint(value,num_bits=None):
+    if not isinstance(value,int):
+        raise Exception('input must be an integer, not %s' % repr(type(value)))
+    if value < 0:
+        raise Exception('input must be non-negative: %s' % repr(value))
+    result = 0
+    extracted_bits = 0
+    while (num_bits is not None and extracted_bits < num_bits) or value != 0:
+        value,rem = divmod(value,2)
+        result = (result<<1) | rem
+        extracted_bits += 1
+    return result
+
+reverse_byte_table = {value:reverse_uint(value,8) for value in range(256)}
+invert_byte_table = {value:invert_uint(value,8) for value in range(256)}
+
+def lmask_byte(num_mask_bits,value):
+    return (((1<<(num_mask_bits))-1)<<(8-num_mask_bits)) & value
+
+def rmask_byte(num_mask_bits,value):
+    return ((1<<(num_mask_bits))-1) & value
+
+class BitStream(object):
+    """
+
+    Bit position = Byte position + remainder bits
+    Stream position = Byte position
+    """
+
+    @classmethod
+    def from_byte_source(klass,byte_source,byte_decoder=None):
+        return klass(byte_source,byte_decoder)
+    @classmethod
+    def from_text_source(klass,text_source,text_encoder,errors='strict',byte_decoder=None):
+        if isinstance(text_source,str):
+            byte_source = io.BytesIO(codecs.encode(text_source,text_encoder,errors))
+        elif isinstance(text_source,(io.TextIOBase,io.StringIO)):
+            codec_info = codecs.lookup(text_encoder)
+            self.byte_source = codecs.StreamReaderWriter(text_source,codec_info.streamreader,code_info.streamwriter,errors)
+        else:
+            raise Exception('Invalid object for BitsIO byte_source: %s' % repr(type(byte_source)))
+        return klass(byte_source,byte_decoder)
+
+    @classmethod
+    def from_file_source(klass,path,mode,byte_decoder=None):
+        if not 'b' in mode:
+            mode += 'b'
+        byte_source = open(path,mode=mode)
+        return klass(byte_source,byte_decoder)
+
+    def __init__(self,byte_source,byte_decoder=None):
+        if isinstance(byte_source,bytes):
+            self.byte_source = io.BytesIO(byte_source)
+        elif isinstance(byte_source,(io.BufferedIOBase,io.BufferedRandom,io.BytesIO)):
+            self.byte_source = byte_source
+        else:
+            raise Exception('Invalid object for BitsIO byte_source: %s' % repr(type(byte_source)))
+        if byte_decoder is not None:
+            codec_info = codecs.lookup(byte_encoder,codec_info.streamreader,codec_info.streamwriter)
+            self.byte_source = codecs.StreamReaderWriter(self.byte_source,codec_info.streamreader,code_info.streamwriter)
+        self.pos_bits = byte_source.tell()*8
+    def close(self):
+        self.byte_source.close()
+    def closed(self):
+        return self.byte_source.closed()
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self,exc_type,exc_value,exc_traceback):
+       self.close() 
+
+    def flush(self):
+        return self.byte_source.flush()
+
+    def isatty(self):
+        return self.byte_source.isatty()
+
+    def readable(self):
+        return self.byte_source.readable()
+
+    def at_eof_byte(self):
+        """
+        If True, subsequent reads should return empty bytes objects
+        """
+        if hasattr(self.byte_source,'get_buffer'):
+            size_bytes = len(self.byte_source.get_buffer())
+            pos_bytes,remainder_bits = divmod(self.pos_bits,8)
+            if remainder_bits > 0:
+                pos_bytes += 1
+            return pos_bytes >= size_bytes
+        elif hasattr(self.byte_source,'peek'):
+            return len(self.byte_source.peek(1)) == 0
+        else:
+            raise Exception()
+
+    def seek(self,offset_bits,whence=io.SEEK_SET):
+        offset_bytes, remainder_bits = divmod(offset_bits,8)
+        seek_result_bytes = self.byte_source.seek(offset_bytes,whence)
+        self.pos_bits = seek_result_bytes*8
+        if seek_result_bytes == offset_bytes and not self.at_eof_byte():
+            self.pos_bits += remainder_bits
+        return self.pos_bits
+        
+    def seekable(self):
+        return self.byte_source.seekable()
+
+    def tell(self):
+        return self.pos_bits
+
+    def writable(self):
+        return self.byte_source.writable()
+
+    def truncate(self,size_bits):
+        pos = self.pos_bits
+        size_bytes, remainder_bits = divmod(size_bits,8)
+        if remainder_bits > 0:
+            effective_size_bytes = size_bytes + 1
+        else:
+            effective_size_bytes = size_bytes
+        new_size_bytes = self.byte_source.truncate(effective_size_bytes)
+        if remainder_bits > 0:
+            self.byte_source.seek(-1,io.SEEK_END)
+            byte_value = list(self.byte_source.read(1))
+            self.byte_source.seek(-1,io.SEEK_END)
+            masked_byte_value = lmask_byte(remainder_bits,byte_value)
+            self.byte_source.write(bytes([masked_byte_value]))
+        self.seek(pos)
+
+    def readbits(self,n):
+        if not isinstance(n,int):
+            raise Exception('input n must be int, not %s' % repr(type(n)))
+        if n == 0:
+            return 0
+        start_pos = self.pos_bits
+        end_pos = self.pos_bits + n
+        start_byte_pos,start_remainder_bits = divmod(start_pos,8)
+        end_byte_pos,end_remainder_bits = divmod(end_pos,8)
+        offset_bytes = end_byte_pos - start_byte_pos
+        invert = False
+        if n > 0:
+            num_bytes = offset_bytes+1
+            reverse = False
+            lstrip = start_remainder_bits
+            rstrip = 8 - end_remainder_bits
+        elif n < 0:
+            num_bytes = -offset_bytes+1
+            self.byte_source.seek(offset_bytes,io.SEEK_CUR)
+            reverse = True
+            lstrip = end_remainder_bits
+            rstrip = 8 - start_remainder_bits
+        else:
+            raise Exception('Provided value not comparable to zero: %s' % repr(n))
+        byte_data = self.byte_source.read(num_bytes)
+        value = bytes_to_uint(byte_data,lstrip,rstrip,reverse,invert)
+        self.seek(end_pos)
+        return value
+
+    def writebits(self,n,value):
+        if not isinstance(n,int):
+            raise Exception('input n must be int, not %s' % repr(type(n)))
+        if n == 0:
+            return
+        start_pos = self.pos_bits
+        end_pos = self.pos_bits + n
+        start_byte_pos,start_remainder_bits = divmod(start_pos,8)
+        end_byte_pos,end_remainder_bits = divmod(end_pos,8)
+        offset_bytes = end_byte_pos - start_byte_pos
+        invert = False
+        if n > 0:
+            first_byte_pos = start_byte_pos
+            loffset = start_reaminder_bits
+            last_byte_pos = end_byte_pos
+            reverse = False
+        else:
+            first_byte_pos = end_byte_pos
+            last_byte_pos = start_byte_pos
+            loffset = end_remainder_bits
+            self.byte_source.seek(end_byte_pos)
+            reverse = True
+        if loffset > 0:
+            first_byte =  list(self.byte_source.read(1))[0]
+        else:
+            first_byte = 0
+        last_byte_lmask = ((loffset + n)%8)
+        roffset = 8 - last_byte_lmask
+        if roffset > 0:
+            self.byte_source.seek(last_byte_pos)
+            last_byte = list(self.byte_source.read(1))[0]
+        else:
+            last_byte = 0
+        self.byte_source.seek(first_byte_pos)
+        byte_data = uint_to_bytes(value,n,loffset,first_byte,last_byte,reverse,invert)
+        self.byte_source.write(byte_data)
+        self.seek(end_pos)
