@@ -1,6 +1,6 @@
 """
 
-Need to translate whatever we get into a sequene of bits or bytes object
+Need to translate whatever we get into a sequence of bits or bytes object
 
 bf = BitForge(<instance of (bytes|BytesIO|file opened as 'rb')>,mode=<'r'|'w'>,codec=<bytes|hex|bin|base64|bz2|zip>)
 
