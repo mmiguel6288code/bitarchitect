@@ -158,7 +158,7 @@ def uint_to_bytes(uint,num_bits=None,loffset=0,lvalue=0,rvalue=0,reverse=False,i
 
         num_bits = How many LSBs are extracted from the unsigned integer to construct the byte stream. If not specified, assume it is the minimum number of bits required to fully represent the unsigned integer. Setting num_bits to any number less than this minimum value will result in an exception being generated.
 
-        By default, the result will be left-justified within the bytes object. A value of 7 would produce a the byte 11100000 or \xE0.
+        The result is right-justified within the specified num_bits, but by default, the result num_bits themselves will be left-justified within the overall bytes object. A value of 7 with num_bits=3 would produce a the byte 11100000 or \\xE0. A value of 7 with num_bits=4 would produce the byte 01110000 or \\x70.
 
         The result is right-shifted within the bytes object by a number of bits equal to loffset which must be between 0 and 7 inclusive.
 
@@ -414,19 +414,27 @@ class BitsIO(object):
         return end
 
     def read(self,n=None):
+        """
+        Reads the specified number of bits from the current seek position.
+        If n is negative, read backwards from the current seek position (reversing the bits).
+        If num_bits is not specified, the remainder of the bytes content is read into a single unsigned integer.
+
+        Returns the unsigned integer value of the bits read, as well as the absolute number of bits read.
+        """
+
         if n is None:
             n = len(self) - self.tell()
         if not isinstance(n,int):
             raise Exception('input n must be int, not %s' % repr(type(n)))
         if n == 0:
-            return 0
+            return 0,0
         start_pos = self.bit_seek_pos
         end_pos = self.bit_seek_pos + n
         start_byte_pos,start_remainder_bits = divmod(start_pos,8)
         end_byte_pos,end_remainder_bits = divmod(end_pos,8)
         offset_bytes = end_byte_pos - start_byte_pos
         invert = False
-        if n > 0:
+        if n > 0: #read forwards
             num_bytes = offset_bytes
             if end_remainder_bits > 0:
                 num_bytes += 1
@@ -435,7 +443,7 @@ class BitsIO(object):
                 rstrip = 0
             reverse = False
             lstrip = start_remainder_bits
-        elif n < 0:
+        elif n < 0: #read backwards
             num_bytes = -offset_bytes
             if start_remainder_bits > 0:
                 num_bytes += 1
@@ -450,12 +458,26 @@ class BitsIO(object):
         byte_data = self.byte_source.read(num_bytes)
         value,num_bits = bytes_to_uint(byte_data,lstrip,rstrip,reverse,invert)
         self.seek(end_pos)
-
-        assert(abs(n)==num_bits)
-
         return value,num_bits
 
-    def writebits(self,n,value):
+    def peek(self,n=None):
+        """
+        Same arguments and return value as read() except that the current seek position is not changed.
+        """
+        pos = self.bit_seek_pos
+        value,num_bits = self.read(n)
+        self.seek(pos)
+        return value,num_bits
+
+    def write(self,value,n=None):
+        """
+        Writes an unsigned integer value as bits at the current seek position.
+        Takes an unsigned integer as well as the number of bits.
+        The unsigned integer value will be right-justified within the specified number of bits.
+        The specified number of bits will be left-justified within the bytes object starting at the current bit seek position.
+
+        If n is negative, the value will be written in reverse backwards from the current seek position.
+        """
         if not isinstance(n,int):
             raise Exception('input n must be int, not %s' % repr(type(n)))
         if n == 0:
@@ -492,3 +514,25 @@ class BitsIO(object):
         byte_data = uint_to_bytes(value,n,loffset,first_byte,last_byte,reverse,invert)
         self.byte_source.write(byte_data)
         self.seek(end_pos)
+    def reverse(self,n=None):
+        """
+        Reverses the next n bits in the byes object without changing the current seek position.
+        If n is not specified, then reverse all bits from the current position to the end.
+        """
+        start_pos = self.tell()
+        value,num_bits = self.read(n)
+        value = reverse_uint(num_bits)
+        self.seek(start_pos)
+        self.write(value,num_bits)
+        self.seek(start_pos)
+    def invert(self,n=None):
+        """
+        Inverts the next n bits in the byes object without changing the current seek position.
+        If n is not specified, then invert all bits from the current position to the end.
+        """
+        start_pos = self.tell()
+        value,num_bits = self.read(n)
+        value = invert_uint(num_bits)
+        self.seek(start_pos)
+        self.write(value,num_bits)
+        self.seek(start_pos)
