@@ -258,7 +258,7 @@ class BitsIO(object):
 
     Writing takes an unsigned integer and writes its value according to the number of specified bits into the stream at the current seek position.
     """
-    def __init__(self,byte_source):
+    def __init__(self,byte_source=None):
         """
         This class may be initialized with either a bytes object or a file-like object.
 
@@ -266,6 +266,10 @@ class BitsIO(object):
 
         If initialized with a file-like object, the file object should be opened in binary mode. The mode property will be set to the mode of the file object if it exists, otherwise it will be "rb+". The seek position will correspond to the first bit (MSB) of the current byte of the file-like object.
         """
+        #if provided None, create an empty BytesIO object
+        if byte_source is None:
+            self.byte_source = io.BytesIO()
+            self.mode = 'rb+'
         #if provided a bytes object, wrap it in a BytesIO object to make a mutable copy
         if isinstance(byte_source,bytes):
             self.byte_source = io.BytesIO(byte_source)
@@ -413,7 +417,7 @@ class BitsIO(object):
         self.seek(pos)
         return end
 
-    def read(self,n=None):
+    def read(self,n=None,reverse=False,invert=False):
         """
         Reads the specified number of bits from the current seek position.
         If n is negative, read backwards from the current seek position (reversing the bits).
@@ -433,7 +437,6 @@ class BitsIO(object):
         start_byte_pos,start_remainder_bits = divmod(start_pos,8)
         end_byte_pos,end_remainder_bits = divmod(end_pos,8)
         offset_bytes = end_byte_pos - start_byte_pos
-        invert = False
         if n > 0: #read forwards
             num_bytes = offset_bytes
             if end_remainder_bits > 0:
@@ -441,7 +444,6 @@ class BitsIO(object):
                 rstrip = 8 - end_remainder_bits
             else:
                 rstrip = 0
-            reverse = False
             lstrip = start_remainder_bits
         elif n < 0: #read backwards
             num_bytes = -offset_bytes
@@ -451,7 +453,7 @@ class BitsIO(object):
             else:
                 rstrip = 0
             self.byte_source.seek(offset_bytes,io.SEEK_CUR)
-            reverse = True
+            reverse = not reverse
             lstrip = end_remainder_bits
         else:
             raise Exception('Provided value not comparable to zero: %s' % repr(n))
@@ -469,7 +471,7 @@ class BitsIO(object):
         self.seek(pos)
         return value,num_bits
 
-    def write(self,value,n=None):
+    def write(self,value,n=None,reverse=False,invert=False):
         """
         Writes an unsigned integer value as bits at the current seek position.
         Takes an unsigned integer as well as the number of bits.
@@ -487,18 +489,16 @@ class BitsIO(object):
         start_byte_pos,start_remainder_bits = divmod(start_pos,8)
         end_byte_pos,end_remainder_bits = divmod(end_pos,8)
         offset_bytes = end_byte_pos - start_byte_pos
-        invert = False
         if n > 0:
             first_byte_pos = start_byte_pos
             loffset = start_remainder_bits
             last_byte_pos = end_byte_pos
-            reverse = False
         else:
             first_byte_pos = end_byte_pos
             last_byte_pos = start_byte_pos
             loffset = end_remainder_bits
             self.byte_source.seek(end_byte_pos)
-            reverse = True
+            reverse = not reverse
         if loffset > 0:
             first_byte =  list(self.byte_source.read(1))[0]
         else:
