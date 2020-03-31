@@ -536,3 +536,15 @@ class BitsIO(object):
         self.seek(start_pos)
         self.write(value,num_bits)
         self.seek(start_pos)
+    def read_remaining_bytes(self):
+        """
+        Reads the remaining bytes of the file as a bytes object
+        """
+        rmask = 8-(self.bit_seek_pos % 8)
+        rest = self.byte_source.read()
+        rest[0] = rmask_byte(rmask,rest[0])
+        self.seek(len(self))
+        return rest
+    def write_remaining_bytes(self,value):
+        ...
+
