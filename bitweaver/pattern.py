@@ -24,7 +24,7 @@ class Directive(Enum):
     NESTOPEN = 11 #args = (,)
     NESTCLOSE = 12 #args = (,)
     ASSERTION = 13 #args = (value,)
-    TAKEALL = 14
+    TAKEALL = 14 #args = (,)
 
 class Encoding(Enum):
     """
@@ -337,6 +337,8 @@ class Operator():
         Return the cumulative results of all calls
         """
         raise NotImplementedError
+    def at_eof(self):
+        return self.bits.at_eof()
     def __getitem__(self,label):
         return self.labels[label]
     def __setitem__(self,label,value):
@@ -713,26 +715,32 @@ class Blueprint():
 
 
 
+    Usage example: Endian swap
+        class EndianSwapper32(Blueprint):
+            @classmethod
+            def definition(operator):
+                while not operator.at_eof(): #repeat for all 32-bit words (i.e. until we run out of data)
+                    operator('r32 r0.8 r8.8 r16.8 r24.8 B32') 
+                        #reverse the next 32 bits, then re-reverses each byte within those 32 bits, then grabs the final modified 32 bits
+        with open('somefile','rb') as f:
+            swapped = b''.join(EndianSwapper32.extract(f))
+        with open('swappedfile','wb') as f:
+            f.write(swapped)
 
 
 
 
 
     """
-    @classmethod
-    def extract(klass,bytes_obj,*args,**kwargs):
-        operator = Extractor(bytes_obj)
-        klass.definition(operator,*args,**kwargs)
-        return operator.results()
-    @classmethod
-    def construct(klass,data_obj,*args,**kwargs):
-        operator = Constructor(data_obj)
-        klass.definition(operator,*args,**kwargs)
-        return operator.results()
-    @classmethod
-    def definition(klass,operator,*args,**kwargs)
-        raise NotImplementedError
 
+def extract(bytes_obj,blueprint_func):
+    operator = Extractor(bytes_obj)
+    blueprint_func(operator)
+    return operator.results()
+def construct(data_obj,blueprint_func):
+    operator = Constructor(data_obj)
+    blueprint_func(operator)
+    return operator.results()
 
-
-
+with open('somefile','rb') as f:
+    swapped = b''.join(extract(f,endian_swapper32))
