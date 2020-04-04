@@ -1,35 +1,10 @@
+"""
+The purpose of this module is to provide a file-like object called BitsIO that behaves like
+BytesIO except that reads, writes, seeks, and other common methods operator at the bit level instead of the byte level.
+"""
+
 import io
 from math import log, floor, ceil
-
-"""
-These tables are precalculated to be used in the functions within this module
-"""
-reverse_byte_table = {value:reverse_uint(value,8) for value in range(256)}
-invert_byte_table = {value:invert_uint(value,8) for value in range(256)}
-SEEK_SET = io.SEEK_SET
-SEEK_CUR = io.SEEK_CUR
-SEEK_END = io.SEEK_END
-
-def lmask_byte(num_mask_bits,value):
-    """
-    This function applies a left-justified mask of a specified number of bits to an unsigned integer representing a single byte value.
-    >>> lmask_byte(3,list(b'\\xff')[0])
-    224
-    >>> bin(224)
-    '0b11100000'
-    """
-    return (((1<<(num_mask_bits))-1)<<(8-num_mask_bits)) & value
-
-def rmask_byte(num_mask_bits,value):
-    """
-    This function applies a right-justified mask of a specified number of bits to an unsigned integer representing a single byte value.
-    >>> rmask_byte(3,list(b'\\xff')[0])
-    7
-    >>> bin(7)
-    '0b111'
-    """
-    return ((1<<(num_mask_bits))-1) & value
-
 def min_bits_uint(uint):
     """
     This function calculates the minimum number of bits needed to represent a given unsigned integer value.
@@ -45,7 +20,7 @@ def min_bits_uint(uint):
     >>> min_bits_uint(257)
     9
     """
-    return int(floor(1+log(value,2))) if value > 0 else 0
+    return int(floor(1+log(uint,2))) if uint > 0 else 0
 
 def invert_uint(uint,num_bits=None):
     """
@@ -97,6 +72,36 @@ def reverse_uint(uint,num_bits=None):
         result = (result<<1) | rem
         extracted_bits += 1
     return result
+"""
+These tables are precalculated to be used in the functions within this module
+"""
+reverse_byte_table = {value:reverse_uint(value,8) for value in range(256)}
+invert_byte_table = {value:invert_uint(value,8) for value in range(256)}
+SEEK_SET = io.SEEK_SET
+SEEK_CUR = io.SEEK_CUR
+SEEK_END = io.SEEK_END
+
+def lmask_byte(num_mask_bits,value):
+    """
+    This function applies a left-justified mask of a specified number of bits to an unsigned integer representing a single byte value.
+    >>> lmask_byte(3,list(b'\\xff')[0])
+    224
+    >>> bin(224)
+    '0b11100000'
+    """
+    return (((1<<(num_mask_bits))-1)<<(8-num_mask_bits)) & value
+
+def rmask_byte(num_mask_bits,value):
+    """
+    This function applies a right-justified mask of a specified number of bits to an unsigned integer representing a single byte value.
+    >>> rmask_byte(3,list(b'\\xff')[0])
+    7
+    >>> bin(7)
+    '0b111'
+    """
+    return ((1<<(num_mask_bits))-1) & value
+
+
 
 def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
     """
@@ -245,6 +250,7 @@ def uint_to_bytes(uint,num_bits=None,loffset=0,lvalue=0,rvalue=0,reverse=False,i
 
 
 class BitsIO(object):
+
     """
     This class imitates a normal bytes file reader but works on the level of individual bits (not bytes).
 
@@ -257,6 +263,25 @@ class BitsIO(object):
     The peek() method is the same as read() except that it does not move the seek position forward. Note that if the underlying byte source object does not directly support peeking, this will be equivalent to performing a tell(), reading, and seeking back to the tell() point.
 
     Writing takes an unsigned integer and writes its value according to the number of specified bits into the stream at the current seek position.
+
+    >>> b = BitsIO(b'hello world')
+    >>> b.read(8)
+    (104, 8)
+    >>> chr(104)
+    'h'
+    >>> bin(104)
+    '0b1101000'
+    >>> b.seek(-4,SEEK_CUR)
+    4
+    >>> b.tell()
+    4
+    >>> b.write(0,1) #write a zero value of size 1 bit
+    >>> bytes(b)
+    b'`ello world'
+    >>> bin(ord('`'))
+    '0b1100000'
+    >>> bin(ord('h'))
+    '0b1101000'
     """
     def __init__(self,byte_source=None):
         """
@@ -306,7 +331,7 @@ class BitsIO(object):
         """
         The object is closed when it is used as a context manager and the context ends.
         """
-       self.close() 
+        self.close() 
 
     def flush(self):
         """
@@ -536,15 +561,46 @@ class BitsIO(object):
         self.seek(start_pos)
         self.write(value,num_bits)
         self.seek(start_pos)
-    def read_remaining_bytes(self):
+    def __bytes__(self):
+        if hasattr(self.byte_source,'getbuffer'):
+            return bytes(self.byte_source.getbuffer())
+        else:
+            pos = self.tell()
+            self.seek(0)
+            result = self.byte_source.read()
+            self.seek(pos)
+            return result
+    def read_bytes(self,n=None,reverse=False,invert=False):
         """
         Reads the remaining bytes of the file as a bytes object
+
+        To account for the situation where the current seek position is in the  middle of the byte, the unsigned integer representation of the remaining bits in that byte as well as the number of bits are also returned in addition to the remaining bytes data.
+        Returns (bytes_data,first_byte_value,first_byte_bits)
         """
         rmask = 8-(self.bit_seek_pos % 8)
-        rest = self.byte_source.read()
-        rest[0] = rmask_byte(rmask,rest[0])
-        self.seek(len(self))
-        return rest
-    def write_remaining_bytes(self,value):
-        ...
+        self.byte_source.seek(self.seek_bit_pos//8)
+        if n is None:
+            rest = self.byte_source.read()
+        else:
+            rest = self.byte_source.read(n)
+        first_value = rmask_byte(rmask,rest[0])
+        self.seek(0,io.SEEK_END)
+        return (first_value,rmask,rest[1:])
+    def write_bytes(self,bytes_data,first_byte_value,first_byte_bits=None):
+        """
+        Writes bytes.
+        To account for the situation of the current seek position being in the middle of a byte, the integer value of that first value and the number of bits can be supplied. The number of bits, if provided, will be validated against the current seek position.
+
+        If the first_byte_value is not provided, it is assumed to be zero.
+        """
+        rmask = 8-(self.bit_seek_pos % 8)
+        if first_byte_bits is not None and first_byte_bits != rmask:
+            raise Exception('write_bytes inputs designate that %d bits are expected in the current byte, however only %d bits are left in the current byte based on bit seek position' % (first_byte_bits,rmask))
+
+        if first_byte_value is None:
+            first_byte_value = 0
+        self.write(first_byte_value,first_byte_bits)
+        self.byte_source.write(bytes_data)
+        self.seek(0,io.SEEK_END)
+        
 

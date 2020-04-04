@@ -1,3 +1,73 @@
+"""
+The primary purpose of this module is to provide the tools needed to define and use bit structure definitions (blueprints) to translate between binary data and parsed data (python lists and values).
+
+The goal is for a single blueprint to specify a bit structure and that no separate code needs to be written to extract vs construct binary data to/from python parsed data.
+
+A blueprint can be either a string or a function with a specific signature.
+A string blueprint is interpreted as a parsing pattern and can be used when the bit structure is fixed and no conditional branching or loops are required to extract the data.
+Otherwise, a function blueprint is used. A function blueprint receives a single argument, by convention, called a tool. The tool may be an instance of either an Extractor class or a Constructor class. The former is used for extracting binary data to python variables. The latter is used for constructing binary data from python variables. From the perspective of designing the blueprint, it does not matter which of the two the tool is when the blueprint function is called. The tool is called with parsing patterns. Different patterns can be applied depending on conditionals and loops in normal python within the blueprint function.
+
+For parsing pattern documentation, see the docstring for the pattern_parse() function.
+
+Usage example: Zip local file header
+    def zip_file_header(tool):
+        \"\"\"
+        See https://en.wikipedia.org/wiki/Zip_(file_format)#Local_file_header 
+        \"\"\"
+        tool('r32 r0.8 r8.8 r16.8 r24.8') #endian swap of first 32 bits - i.e. reverse next 32 bits, then reverse back each byte
+        signature, = tool('x32 #"signature"') 
+            #This capture the zip header signature as hex string
+            #The return value of tool() contains all captured values
+            #The pattern #"<label>" is used to assign the previously extracted value to a label
+
+        assert(signature == tool['signature']) #can treat tool like a dictionary to grab values that we assigned to labels
+
+        #grab the next fixed length items
+        fields = tool('''
+            {u16}5 {u32}3 
+            u16 #"filename_len" 
+            u16 #"extra_field_len"
+            ''')
+            #{<pattern>}<n> repeats the pattern n times
+
+        #use the filename_len value to determine how many bits to grab an reinterpret as a bytes object (basically a string); "B" is for Bytes
+        filename_pattern = 'B' + str(8*tool['filename_len'])
+        tool(filename_pattern)
+
+        #the extra field length is the number of bytes the extra field is made of. The extra field is composed of chunks with a 16 bit code and a 16 bit length
+        m = tool['extra_field_len']
+        num_chunks = m/4 #m bytes = m/4 chunks since each chunk is 32 bits
+        extra_pattern = '{[u16 u16]}' + str(num_chunks) 
+            #the [ and ] characters inside denote that the two u16 values should be captured together (in their own sublist)
+        tool('['+extra_pattern+']') #capture all the extra field chunks in a single large sublist
+
+        tool('B!') #grab the rest of the file as a bytes object
+
+    with open('somefile.zip','rb') as f:
+        data = extract(zip_file_header,f)
+        #data[0] will be the signature
+        ...
+        #data[6] will be CRC-32
+        ...
+        #data[12] will be a list of pairs of ID codes and lengths corresponding to the extra field
+        #data[13] will be a bytes object corresponding to the rest of the file
+
+    data[6] = 0 #erase the CRC
+    with open('badfile.zip','wb') as f:
+        construct(zip_file_header,f)
+    #this writes an identical copy of the original zip file except that the CRC-32 is zeroed out
+
+
+Usage example: Endian swap
+    def endian_swapper32(tool):
+        while not tool.at_eof(): #repeat for all 32-bit words (i.e. until we run out of data)
+            tool('r32 r0.8 r8.8 r16.8 r24.8 B32') 
+                #reverse the next 32 bits, then re-reverses each byte within those 32 bits, then grabs the final modified 32 bits
+    with open('somefile','rb') as f:
+        swapped = extract(endian_swapper32,f)
+    with open('swappedfile','wb') as f:
+        f.write(b''.join(swapped))
+"""
 import re, ast, io, struct
 from enum import Enum
 from math import ceil
@@ -33,7 +103,7 @@ class Encoding(Enum):
     UINT = 1 #unsigned integer
     SINT = 2 #signed 2's complement integer
     SPFP = 3 #single precision floating point
-    DBFP = 4 #double precision floating point
+    DPFP = 4 #double precision floating point
     LHEX = 5 #lower case hex string 
     UHEX = 6 #upper case hex string 
     BINS = 7 #bin string
@@ -55,7 +125,7 @@ class Setting(Enum):
     TOGGLE=2
 
 
-def parse(pattern):
+def pattern_parse(pattern):
     """
     Interprets the provided pattern into a sequence of directives and arguments.
 
@@ -79,6 +149,12 @@ def parse(pattern):
         i<n> = Invert the next n bits without moving the seek position
         r<m>.<n> = Reverse the n bits that are offset forward from the current seek position by m bits. Does not move the seek position
         i<m>.<n> = Invert the n bits that are offset forward from the current seek position by m bits. Does not move the seek position
+        e<n> = Endian swap. n must be a multiple of 8. Equivalent to reversing all n bits and then individually reversing each byte. Does not move the seek position.
+
+    Lengthless tokens:
+        B! = Represents the rest of the data stream. Translates to a triplet [byte_data,first_byte_value, first_byte_bits]. The second two parameters represent the remainder of the current byte while the first parameter is the byte data after.
+        r! = Reverses all bits between the current position and the end of the set of data.
+        i! = Inverts all bits between the current position and the end of the set of data.
 
     In the expressions defining the following tokens, <t|y|n> refers to any of the three letters "t", "y", or "n".
         "y" is interpreted as yes or True
@@ -108,13 +184,17 @@ def parse(pattern):
     Repetition:
         {<pattern>}<n> = Repeat the pattern n times
 
+    Comments:
+        ##<any string> 
+
     """
     pos = 0
-    tok_parse = re.compile('\\s*([ri]\\d+\\.\\d+|[usfxXbBnpjJrizo]\\d+|[RI][ynt]|!#"|#"|=#"|[\\[\\]=\\{\\}]|B!')
+    tok_parse = re.compile('\\s*([ri]\\d+\\.\\d+|[usfxXbBnpjJrizo]\\d+|[RI][ynt]|!#"|#["#]|=#"|[\\[\\]=\\{\\}]|[riB]!')
     label_parse = re.compile('([^"]+)"')
     space_equals_parse = re.compile('\\s*=')
     expr_parse = re.compile('([^;]+);')
     num_parse = re.compile('\\d+')
+    comment_parse = re.compile('.+\n',re.S)
 
     no_arg_codes = {
             '[': Directive.NESTOPEN,
@@ -167,11 +247,18 @@ def parse(pattern):
             instruction = (tok,directive,m,n,modtype)
         elif tok == 'B!': #TAKEALL
             instruction = (tok,Directive.TAKEALL)
+        elif tok == 'r!': #MOD
+            instruction = (tok,Directive.MOD,None,ModType.REVERSE)
+        elif tok == 'i!': #MOD
+            instruction = (tok,Directive.MOD,None,ModType.REVERSE)
         elif code in num_and_arg_codes: #VALUE, MOD
             directive,arg = num_and_arg_tokens[code]
             n = int(tok[1:])
             if code in negate_num_tokens:
                 n = -n
+            if code == 'e':
+                if n % 8 != 0:
+                    raise Exception('"e" tokens must have a size that is a multiple of 8 bits: %s' % tok)
             instruction = (tok,directive,n,arg)
         elif code in no_arg_codes: #NESTOPEN, NESTCLOSE
             directive = no_arg_codes[code]
@@ -224,7 +311,10 @@ def parse(pattern):
             pos = num_match.end(0)
             repetition_capture[0] = int(num_match.group(0)) #population first element with repetition number
             if len(repetition_stack) == 0: #if all repetitions are done
-                yield from process_repetition_capture(repetition_capture)
+                yield from _process_repetition_capture(repetition_capture)
+        elif tok == '##': #COMMENT
+            comment_match = comment_parse.match(pattern,pos)
+            pos = expr_match.end(0)
         else:
             raise Exception('Unknown token: %s' % tok)
 
@@ -235,12 +325,12 @@ def parse(pattern):
                 yield instruction
         tokmatch = tok_parse.match(pattern,pos)
         pos = tokmatch.end(0)
-def process_repetition_capture(repetition_capture):
+def _process_repetition_capture(repetition_capture):
     count = repetition_capture[0]
     for iteration in range(count):
         for item in repetition_capture[1:]:
             if isinstance(item,list):
-                yield from process_repetition_capture(item)
+                yield from _process_repetition_capture(item)
             else:
                 yield item
 
@@ -263,7 +353,7 @@ def uint_decode(uint_value,num_bits,encoding):
         #return (float(mantissa)/(1<<23)+1)*(1<<(exponent-127))*(-1)**sign
         if num_bits != 32:
             raise Exception('Single Precision Floating Point values must be 32 bits')
-        return struct.unpack('f',bits_io.uint_to_bytes(uint_value,num_bits))[0]
+        return struct.unpack('>f',bits_io.uint_to_bytes(uint_value,num_bits))[0]
     elif encoding == Encoding.DPFP:
         #1 sign bit, 11 exponent bits, 52 mantissa bits
         #uint_value,mantissa = divmod(uint_value,1<<52)
@@ -271,7 +361,7 @@ def uint_decode(uint_value,num_bits,encoding):
         #return (float(mantissa)/(1<<52)+1)*(1<<(exponent-1023))*(-1)**sign
         if num_bits != 64:
             raise Exception('Double Precision Floating Point values must be 64 bits')
-        return struct.unpack('d',bits_io.uint_to_bytes(uint_value,num_bits))[0]
+        return struct.unpack('>d',bits_io.uint_to_bytes(uint_value,num_bits))[0]
     elif encoding == Encoding.LHEX:
         num_hex_digits = int(ceil(num_bits/4.0))
         return (('%%0%dx' % num_hex_digits) % uint_value)
@@ -287,6 +377,57 @@ def uint_decode(uint_value,num_bits,encoding):
 def uint_encode(value,num_bits,encoding):
     """
     Takes a value and encodes it into a uint according to a supported encoding scheme
+
+    >>> uint_encode('000101',6,Encoding.BINS)
+    5
+    >>> uint_decode(5,6,Encoding.BINS)
+    '000101'
+    >>> ord('A')
+    65
+    >>> uint_decode(65,8,Encoding.BYTS)
+    b'A'
+    >>> import struct, math
+    >>> from formats import to_hex
+    >>> to_hex(struct.pack('>f',math.pi))
+    b'40490fdb'
+    >>> '%08x' % uint_encode(math.pi,32,Encoding.SPFP)[0]
+    '40490fdb'
+
+    >>> 
+    >>> import struct, math
+    >>> from formats import to_hex
+    >>> to_hex(struct.pack('>d',math.pi))
+    b'400921fb54442d18'
+    >>> '%08x' % uint_encode(math.pi,64,Encoding.DPFP)
+    Traceback (most recent call last):
+      File "<console>", line 1, in <module>
+    TypeError: not all arguments converted during string formatting
+    >>> '%08x' % uint_encode(math.pi,64,Encoding.DPFP)[0]
+    '400921fb54442d18'
+    >>> Encoding
+    <enum 'Encoding'>
+    >>> dir(Encoding)
+    ['BINS', 'BYTS', 'DPFP', 'LHEX', 'SINT', 'SPFP', 'UHEX', 'UINT', '__class__', '__doc__', '__members__', '__module__']
+    >>> uint_encode(777,Encoding.BINS)
+    Traceback (most recent call last):
+      File "<console>", line 1, in <module>
+    TypeError: uint_encode() missing 1 required positional argument: 'encoding'
+    >>> uint_encode(777,32,Encoding.BINS)
+    Traceback (most recent call last):
+      File "<console>", line 1, in <module>
+      File "/storage/emulated/0/Code/bitweaver/bitweaver/pattern.py", line 390, in uint_encode
+        return int(value,2)
+    TypeError: int() can't convert non-string with explicit base
+    >>> uint_encode('110010100101',32,Encoding.BINS)
+    3237
+    >>> uint_encode('111111',6,Encoding.SINT)
+    Traceback (most recent call last):
+      File "<console>", line 1, in <module>
+      File "/storage/emulated/0/Code/bitweaver/bitweaver/pattern.py", line 379, in uint_encode
+        if value >= 0:
+    TypeError: '>=' not supported between instances of 'str' and 'int'
+    >>> uint_encode(-1,6,Encoding.SINT)
+    63
     """
     if encoding == Encoding.UINT:
         return value
@@ -296,9 +437,9 @@ def uint_encode(value,num_bits,encoding):
         else:
             return value + (1<<num_bits)
     elif encoding == Encoding.SPFP:
-        return bits_io.bytes_to_uint(struct.pack('f',value))
+        return bits_io.bytes_to_uint(struct.pack('>f',value))
     elif encoding == Encoding.DPFP:
-        return bits_io.bytes_to_uint(struct.pack('d',value))
+        return bits_io.bytes_to_uint(struct.pack('>d',value))
     elif encoding == Encoding.LHEX or encoding == Encoding.UHEX:
         return int(value,16)
     elif encoding == Encoding.BINS:
@@ -313,21 +454,21 @@ class IncompleteDataError(Exception):pass
 class MatchLabelError(Exception):pass
 class NestingError(Exception):pass
 
-class Operator():
+class Tool():
     """
     This is a common base class for the Extractor and Constructor classes.
-    In both classes, the way the API for accessing label data is the same - basically treat the operator object as if it were a dictionary
+    In both classes, the way the API for accessing label data is the same - basically treat the tool object as if it were a dictionary
 
     The __init__(), __call__(), results(), and handle_...() functions must be implemented by each subclass.
     """
     def __init__(self,data_source,labels=None):
         """
-        Initialize the operator object with a data source and a labels dictionary
+        Initialize the tool object with a data source and a labels dictionary
         """
         raise NotImplementedError
     def __call__(self,pattern):
         """
-        Apply the operator against the data source according to the provided pattern.
+        Apply the tool against the data source according to the provided pattern.
         Return the data record consisting of the values corresponding to the pattern data.
         """
         raise NotImplementedError
@@ -356,7 +497,7 @@ class Operator():
     def __len__(self):
         return len(self.labels)
 
-class Extractor(Operator):
+class Extractor(Tool):
     """
     The Extractor takes binary bytes data and extracts data values out of it.
     """
@@ -374,7 +515,7 @@ class Extractor(Operator):
     def __call__(self,pattern):
         self.data_record = []
         self.stack_record = [self.data_record]
-        for instruction in parse(pattern):
+        for instruction in pattern_parse(pattern):
             tok = instruction[0]
             self.tok = tok
             directive = instruction[1]
@@ -418,6 +559,13 @@ class Extractor(Operator):
             self.bits.reverse(num_bits)
         elif modtype == ModType.INVERT:
             self.bits.invert(num_bits)
+        elif modtype == ModType.ENDIANSWAP:
+            pos = self.tell()
+            self.bits.reverse(num_bits)
+            for i in range(0,num_bits,8):
+                self.bits.reverse(8)
+                self.seek(8,SEEK_CUR)
+            self.seek(pos)
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
     def handle_modoff(self,offset_bits,num_bits,modtype):
@@ -478,7 +626,7 @@ class Extractor(Operator):
         if self.last_value != value:
             raise AssertionError('Token = %s; Expected value = %s; Extracted value = %s' % (self.tok,repr(value),repr(self.last_value)))
     def handle_takeall(self):
-        value = self.bits.remaining_bytes(reverse=self.reverse_all,invert=self.invert_all)
+        value = self.bits.read_bytes(reverse=self.reverse_all,invert=self.invert_all)
         self.stack_record[-1].append(value)
         self.stack_extraction[-1].append(value)
         self.last_value = value
@@ -487,9 +635,12 @@ class Extractor(Operator):
 def flatten(data_obj):
     """
     The flatten function takes a nested data structure (list of lists of lists etc) and returns a flattened version of it (list of values) as well as a flatten pattern that stores the nesting information.
+
+    >>> flatten([1,'abc',[0,[1,1,[5]],'def'],9,10,11])
+    ([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '[..[.[..[.]].]...]')
     """
     flat = []
-    pattern = []
+    pattern = ['[']
     stack = [[data_obj,0]]
     while len(stack) > 0:
         target,pos = stack[-1]
@@ -510,7 +661,12 @@ def deflatten(flat,pattern):
     """
     The deflatten function takes a flat data structure (list of values) and a flatten pattern, and produces a nested data structure according to those inputs.
     This is the inverse function of flatten()
+    >>> deflatten([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '[..[.[..[.]].]...]')
+    [1, 'abc', [0, [1, 1, [5]], 'def'], 9, 10, 11]
     """
+    if pattern[0] != '[':
+        raise Exception('All valid flatten patterns must start with "["')
+    pattern = pattern[1:]
     data_obj = []
     stack = [data_obj]
     pos = 0
@@ -528,7 +684,7 @@ def deflatten(flat,pattern):
 
         
 
-class Constructor(Operator):
+class Constructor(Tool):
     """
     The Constructor class takes a sequence of values (nested or not), and constructs a byte sequence according to provided patterns.
     """
@@ -550,7 +706,7 @@ class Constructor(Operator):
     def __call__(self,pattern):
         self.data_record = []
         self.stack = [data_record]
-        for instruction in parse(pattern):
+        for instruction in pattern_parse(pattern):
             tok = instruction[0]
             self.tok = tok
             directive = instruction[1]
@@ -602,7 +758,14 @@ class Constructor(Operator):
         self.bits.write(0,num_bits,reverse=self.reverse_all,invert=not self.invert_all)
     def handle_mod(self,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
-        self.mod_operations.append((self.tok,mod_type,self.bits.tell(),num_bits))
+        if modtype == ModType.REVERSE or modtype == ModType.INVERT:
+            self.mod_operations.append((self.tok,mod_type,self.bits.tell(),num_bits))
+        elif modtype == ModType.ENDIANSWAP:
+            pos = self.bits.tell()
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,num_bits))
+            for i in range(0,num_bits,8):
+                self.mod_operations.append((self.tok,ModType.REVERSE,pos+i,8))
+
     def handle_modoff(self,offset_bits,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
         self.mod_operations.append((self.tok,mod_type,self.bits.tell()+offset_bits,num_bits))
@@ -655,92 +818,13 @@ class Constructor(Operator):
         self.bits.write_remaining_bytes(value)
         self.last_value = value
 
-class Blueprint():
-    """
-    The Blueprint class is intended to be subclassed into sublcasses that define a binary structure.
-    The subclass can then be used to either extract data from a byte sequence or construct a byte sequence given data.
-
-
-    Usage example: Zip local file header
-        class ZipLocalFileHeader(Blueprint):
-            \"\"\"
-            See https://en.wikipedia.org/wiki/Zip_(file_format)#Local_file_header 
-            \"\"\"
-            @classmethod
-            def definition(operator):
-                operator('r32 r0.8 r8.8 r16.8 r24.8') #endian swap of first 32 bits - i.e. reverse next 32 bits, then reverse back each byte
-                signature, = operator('x32 #"signature"') 
-                    #This capture the zip header signature as hex string
-                    #The return value of operator() contains all captured values
-                    #The pattern #"<label>" is used to assign the previously extracted value to a label
-
-                assert(signature == operator['signature']) #can treat operator like a dictionary to grab values that we assigned to labels
-
-                #grab the next fixed length items
-                fields = operator('''
-                    {u16}5 {u32}3 
-                    u16 #"filename_len" 
-                    u16 #"extra_field_len"
-                    ''')
-                    #{<pattern>}<n> repeats the pattern n times
-
-                #use the filename_len value to determine how many bits to grab an reinterpret as a bytes object (basically a string); "B" is for Bytes
-                filename_pattern = 'B' + str(8*operator['filename_len'])
-                operator(filename_pattern)
-
-                #the extra field length is the number of bytes the extra field is made of. The extra field is composed of chunks with a 16 bit code and a 16 bit length
-                m = operator['extra_field_len']
-                num_chunks = m/4 #m bytes = m/4 chunks since each chunk is 32 bits
-                extra_pattern = '{[u16 u16]}' + str(num_chunks) 
-                    #the [ and ] characters inside denote that the two u16 values should be captured together (in their own sublist)
-                operator('['+extra_pattern+']') #capture all the extra field chunks in a single large sublist
-
-                operator('B!') #grab the rest of the file as a bytes object
-
-        with open('somefile.zip','rb') as f:
-            data = ZipLocalFileHeader.extract(f)
-            #data[0] will be the signature
-            ...
-            #data[6] will be CRC-32
-            ...
-            #data[12] will be a list of pairs of ID codes and lengths corresponding to the extra field
-            #data[13] will be a bytes object corresponding to the rest of the file
-
-        data[6] = 0 #erase the CRC
-        with open('badfile.zip','wb') as f:
-            f.write(ZipLocalFileHeader.construct(data).getbuffer())
-        #this writes an identical copy of the original zip file except that the CRC-32 is zeroed out
-
-
-
-
-
-    Usage example: Endian swap
-        class EndianSwapper32(Blueprint):
-            @classmethod
-            def definition(operator):
-                while not operator.at_eof(): #repeat for all 32-bit words (i.e. until we run out of data)
-                    operator('r32 r0.8 r8.8 r16.8 r24.8 B32') 
-                        #reverse the next 32 bits, then re-reverses each byte within those 32 bits, then grabs the final modified 32 bits
-        with open('somefile','rb') as f:
-            swapped = b''.join(EndianSwapper32.extract(f))
-        with open('swappedfile','wb') as f:
-            f.write(swapped)
-
-
-
-
-
-    """
-
 def extract(bytes_obj,blueprint_func):
-    operator = Extractor(bytes_obj)
-    blueprint_func(operator)
-    return operator.results()
-def construct(data_obj,blueprint_func):
-    operator = Constructor(data_obj)
-    blueprint_func(operator)
-    return operator.results()
+    tool = Extractor(bytes_obj)
+    blueprint_func(tool)
+    return tool.results()
 
-with open('somefile','rb') as f:
-    swapped = b''.join(extract(f,endian_swapper32))
+def construct(data_obj,blueprint_func):
+    tool = Constructor(data_obj)
+    blueprint_func(tool)
+    return tool.results()
+
