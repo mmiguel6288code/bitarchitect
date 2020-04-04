@@ -301,7 +301,7 @@ class BitsIO(object):
             self.mode = 'rb+'
         elif isinstance(byte_source,(io.BufferedIOBase,io.BufferedRandom,io.BytesIO)):
             if hasattr(byte_source,'mode'):
-                if not 'b' in mode:
+                if not 'b' in byte_source.mode:
                     raise Exception('File-like object provided to BitsIO must be opened in binary mode i.e. must have "b": mode = %s' % byte_source.mode)
                 self.mode = byte_source.mode
             else:

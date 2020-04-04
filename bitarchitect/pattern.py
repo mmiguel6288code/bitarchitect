@@ -8,74 +8,11 @@ A string blueprint is interpreted as a parsing pattern and can be used when the 
 Otherwise, a function blueprint is used. A function blueprint receives a single argument, by convention, called a tool. The tool may be an instance of either an Extractor class or a Constructor class. The former is used for extracting binary data to python variables. The latter is used for constructing binary data from python variables. From the perspective of designing the blueprint, it does not matter which of the two the tool is when the blueprint function is called. The tool is called with parsing patterns. Different patterns can be applied depending on conditionals and loops in normal python within the blueprint function.
 
 For parsing pattern documentation, see the docstring for the pattern_parse() function.
-
-Usage example: Zip local file header
-    def zip_file_header(tool):
-        \"\"\"
-        See https://en.wikipedia.org/wiki/Zip_(file_format)#Local_file_header 
-        \"\"\"
-        tool('r32 r0.8 r8.8 r16.8 r24.8') #endian swap of first 32 bits - i.e. reverse next 32 bits, then reverse back each byte
-        signature, = tool('x32 #"signature"') 
-            #This capture the zip header signature as hex string
-            #The return value of tool() contains all captured values
-            #The pattern #"<label>" is used to assign the previously extracted value to a label
-
-        assert(signature == tool['signature']) #can treat tool like a dictionary to grab values that we assigned to labels
-
-        #grab the next fixed length items
-        fields = tool('''
-            {u16}5 {u32}3 
-            u16 #"filename_len" 
-            u16 #"extra_field_len"
-            ''')
-            #{<pattern>}<n> repeats the pattern n times
-
-        #use the filename_len value to determine how many bits to grab an reinterpret as a bytes object (basically a string); "B" is for Bytes
-        filename_pattern = 'B' + str(8*tool['filename_len'])
-        tool(filename_pattern)
-
-        #the extra field length is the number of bytes the extra field is made of. The extra field is composed of chunks with a 16 bit code and a 16 bit length
-        m = tool['extra_field_len']
-        num_chunks = m/4 #m bytes = m/4 chunks since each chunk is 32 bits
-        extra_pattern = '{[u16 u16]}' + str(num_chunks) 
-            #the [ and ] characters inside denote that the two u16 values should be captured together (in their own sublist)
-        tool('['+extra_pattern+']') #capture all the extra field chunks in a single large sublist
-
-        tool('B!') #grab the rest of the file as a bytes object
-
-    with open('somefile.zip','rb') as f:
-        data = extract(zip_file_header,f)
-        #data[0] will be the signature
-        ...
-        #data[6] will be CRC-32
-        ...
-        #data[12] will be a list of pairs of ID codes and lengths corresponding to the extra field
-        #data[13] will be a bytes object corresponding to the rest of the file
-
-    data[6] = 0 #erase the CRC
-    with open('badfile.zip','wb') as f:
-        construct(zip_file_header,f)
-    #this writes an identical copy of the original zip file except that the CRC-32 is zeroed out
-
-
-Usage example: Endian swap
-    def endian_swapper32(tool):
-        while not tool.at_eof(): #repeat for all 32-bit words (i.e. until we run out of data)
-            tool('r32 r0.8 r8.8 r16.8 r24.8 B32') 
-                #reverse the next 32 bits, then re-reverses each byte within those 32 bits, then grabs the final modified 32 bits
-    with open('somefile','rb') as f:
-        swapped = extract(endian_swapper32,f)
-    with open('swappedfile','wb') as f:
-        f.write(b''.join(swapped))
 """
 import re, ast, io, struct
 from enum import Enum
 from math import ceil
-import bits_io
-
-SEEK_SET = bits_io.SEEK_SET
-SEEK_CUR = bits_io.SEEK_CUR
-SEEK_END = bits_io.SEEK_END
+from .bits_io import SEEK_SET, SEEK_CUR, SEEK_END, uint_to_bytes, bytes_to_uint, BitsIO
 
 class Directive(Enum):
     """
@@ -162,8 +99,8 @@ def pattern_parse(pattern):
         "t" is interpreted as toggle from the current value i.e. yes -> no and no -> yes
 
     Setting tokens:
-        R<t|y|n>  = Reverse all setting. Settings are preserved from execution to execution of the same session.
-        I<t|y|n> = Invert all setting. Settings are preserved from execution to execution of the same session.
+        R<t|y|n>  = Reverse all setting. When enabled, each read is preceded by a reversal for the same number of bits. e.g. u<n> is treated as r<n>u<n>
+        I<t|y|n> = Invert all setting. When enabled, each read is preceded by an inversion for the same number of bits. e.g. u<n> is treated as i<n>u<n>
 
     Non-value consuming tokens:
         z<n> = Represents a sequence of zeros n bits long
@@ -171,7 +108,7 @@ def pattern_parse(pattern):
         n<n> = The next n bits are don't cares that are skipped in extracting and assumed zero in constructing
 
     Value Nesting:
-        [...] = Signify structural nesting. Each open nesting within a pattern should be closed.
+        [...] = Signify structural nesting
 
     Labels assignment:
         #"<label>" = Associate the previously parsed value with the label specified between the double quotes. Label names can consist of any characters besides the double quote character.
@@ -179,7 +116,7 @@ def pattern_parse(pattern):
 
     Assertions:
         =<python_expr>; = Assert the previously parsed value, decoded to final form (e.g. hex) is equal to the evaluation of the provided python expression. The python expression must not contain a semi-colon nor a pound sign (#). The expression should be a python literal, not refer to a variable.
-        =#"<label>" = Assert the previously parsed value, decoded to final form (e.g. hex) is equal to the value associated with the provided label
+        =#"<label>" = Assert the previously parsed value, decoded to final form (e.g. hex) is equal to the most recent value associated with the provided label
 
     Repetition:
         {<pattern>}<n> = Repeat the pattern n times
@@ -353,7 +290,7 @@ def uint_decode(uint_value,num_bits,encoding):
         #return (float(mantissa)/(1<<23)+1)*(1<<(exponent-127))*(-1)**sign
         if num_bits != 32:
             raise Exception('Single Precision Floating Point values must be 32 bits')
-        return struct.unpack('>f',bits_io.uint_to_bytes(uint_value,num_bits))[0]
+        return struct.unpack('>f',uint_to_bytes(uint_value,num_bits))[0]
     elif encoding == Encoding.DPFP:
         #1 sign bit, 11 exponent bits, 52 mantissa bits
         #uint_value,mantissa = divmod(uint_value,1<<52)
@@ -361,7 +298,7 @@ def uint_decode(uint_value,num_bits,encoding):
         #return (float(mantissa)/(1<<52)+1)*(1<<(exponent-1023))*(-1)**sign
         if num_bits != 64:
             raise Exception('Double Precision Floating Point values must be 64 bits')
-        return struct.unpack('>d',bits_io.uint_to_bytes(uint_value,num_bits))[0]
+        return struct.unpack('>d',uint_to_bytes(uint_value,num_bits))[0]
     elif encoding == Encoding.LHEX:
         num_hex_digits = int(ceil(num_bits/4.0))
         return (('%%0%dx' % num_hex_digits) % uint_value)
@@ -372,7 +309,7 @@ def uint_decode(uint_value,num_bits,encoding):
         return ('{:0%db}' % num_bits).format(uint_value)
     elif encoding == Encoding.BYTS:
         num_total_bits = num_bits + (num_bits % 8)
-        return bits_io.uint_to_bytes(uint_value,num_total_bits)
+        return uint_to_bytes(uint_value,num_total_bits)
 
 def uint_encode(value,num_bits,encoding):
     """
@@ -437,15 +374,15 @@ def uint_encode(value,num_bits,encoding):
         else:
             return value + (1<<num_bits)
     elif encoding == Encoding.SPFP:
-        return bits_io.bytes_to_uint(struct.pack('>f',value))
+        return bytes_to_uint(struct.pack('>f',value))
     elif encoding == Encoding.DPFP:
-        return bits_io.bytes_to_uint(struct.pack('>d',value))
+        return bytes_to_uint(struct.pack('>d',value))
     elif encoding == Encoding.LHEX or encoding == Encoding.UHEX:
         return int(value,16)
     elif encoding == Encoding.BINS:
         return int(value,2)
     elif encoding == Encoding.BYTS:
-        return bits_io.bytes_to_uint(value)
+        return bytes_to_uint(value)
 
 class ZerosError(Exception):pass
 class OnesError(Exception):pass
@@ -454,18 +391,106 @@ class IncompleteDataError(Exception):pass
 class MatchLabelError(Exception):pass
 class NestingError(Exception):pass
 
+def flatten(data_obj):
+    """
+    The flatten function takes a nested data structure (list of lists of lists etc) and returns a flattened version of it (list of values) as well as a flatten pattern that stores the nesting information.
+
+    >>> flatten([1,'abc',[0,[1,1,[5]],'def'],9,10,11])
+    ([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '..[.[..[.]].]...')
+    """
+    flat_list = []
+    flat_pattern = []
+    stack = [[data_obj,0]]
+    while len(stack) > 0:
+        target,pos = stack[-1]
+        if pos >= len(target):
+            stack.pop(-1)
+            flat_pattern.append(']')
+        else:
+            item = target[pos]
+            stack[-1][1] += 1
+            if isinstance(item,(list,tuple)):
+                stack.append([item,0])
+                flat_pattern.append('[')
+            else:
+                flat_list.append(item)
+                flat_pattern.append('.')
+    flat_pattern.pop(-1)
+    return flat_list,''.join(flat_pattern)
+def deflatten(flat_pattern,flat_list):
+    """
+    The deflatten function takes a flat data structure (list of values) and a flatten pattern, and produces a nested data structure according to those inputs.
+    This is the inverse function of flatten()
+    >>> deflatten([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '..[.[..[.]].]...')
+    [1, 'abc', [0, [1, 1, [5]], 'def'], 9, 10, 11]
+    """
+    data_obj = []
+    stack = [data_obj]
+    pos = 0
+    for token in flat_pattern:
+        if token == '[':
+            new_record = []
+            stack[-1].append(new_record)
+            stack.append(new_record)
+        elif token == ']':
+            stack.pop(-1)
+        elif token == '.':
+            stack[-1].append(flat_list[pos])
+            pos += 1
+    return data_obj
+def get_flat_index(flat_pattern,nested_indices):
+    nested_indices = list(nested_indices)
+    cumulative_index = 0
+    index_stack = [0]
+    target_index = nested_indices.pop(0)
+    last_index = len(nested_indices) == 0
+    skip_level = None
+    for p in flat_pattern:
+        if p == '[':
+            if not last_index and target_index == index_stack[-1]:
+                target_index = nested_indices.pop(0)
+                last_index = len(nested_indices) == 0
+            else:
+                skip_level = len(index_stack)
+            index_stack.append(0)
+        elif p == '.':
+            if last_index and target_index == index_stack[-1]:
+                return cumulative_index
+            index_stack[-1] += 1
+            cumulative_index += 1
+        elif p == ']':
+            index_stack.pop(-1)
+            index_stack[-1] += 1
+            if skip_level is not None and len(index_stack) == skip_level:
+                skip_level = None
+        
+def get_nested_indices(flat_pattern,flat_index):
+    index_stack = [0]
+    cumulative_index = 0
+    for p in flat_pattern:
+        if p == '[':
+            index_stack.append(0)
+        elif p == '.':
+            if cumulative_index == flat_index:
+                return index_stack
+            index_stack[-1] += 1
+        elif p == ']':
+            index_stack.pop(-1)
+            index_stack[-1] += 1
+
+
+
 class Tool():
     """
     This is a common base class for the Extractor and Constructor classes.
-    In both classes, the way the API for accessing label data is the same - basically treat the tool object as if it were a dictionary
-
-    The __init__(), __call__(), results(), and handle_...() functions must be implemented by each subclass.
+    The __init__(), __call__(), and handle_...() functions must be implemented by each subclass.
     """
-    def __init__(self,data_source,labels=None):
+    def __init__(self,data_source):
         """
-        Initialize the tool object with a data source and a labels dictionary
+        Initialize the tool object with a data source
         """
         raise NotImplementedError
+        self.labels = {}
     def __call__(self,pattern):
         """
         Apply the tool against the data source according to the provided pattern.
@@ -473,48 +498,46 @@ class Tool():
         """
         raise NotImplementedError
         return data_record
-    def results(self):
-        """
-        Return the cumulative results of all calls
-        """
+
+    def finalize(self):
         raise NotImplementedError
+
     def at_eof(self):
         return self.bits.at_eof()
-    def __getitem__(self,label):
-        return self.labels[label]
-    def __setitem__(self,label,value):
-        self.labels[label] = value
-    def __delitem__(self,label):
-        del self.labels[label]
-    def keys(self):
-        yield from self.labels.keys()
-    def items(self):
-        yield from self.labels.items()
-    def values(self):
-        yield from self.labels.values()
-    def __iter__(self):
-        yield from self.labels
-    def __len__(self):
-        return len(self.labels)
+
+    def __bytes__(self):
+        return bytes(self.bits_io_obj)
+
 
 class Extractor(Tool):
     """
     The Extractor takes binary bytes data and extracts data values out of it.
     """
-    def __init__(self,bytes_obj,labels=None):
-        self.bytes_obj = bytes_obj
-        self.bits = bits_io.BitsIO(bytes_obj)
+    def __init__(self,bytes_io_obj):
+        self.bytes_io_obj = bytes_io_obj
+        self.bits_io_obj = BitsIO(bytes_io_obj)
+
         self.reverse_all = False
         self.invert_all = False
+
         self.last_value = None
-        if labels is None:
-            labels = {}
-        self.labels = labels
-        self.data_extraction = []
-        self.stack_extraction = [self.data_extraction]
+        self.last_index_stack = None
+
+        self.labels = {}
+
+        self.flat_list = []
+        self.flat_labels = []
+        self.flat_pattern = [] #list of characters
+        self.flat_pos = 0
+        self.index_stack = [0]
+
+        self.data_obj = []
+        self.stack_data = [self.data_obj]
+
     def __call__(self,pattern):
         self.data_record = []
         self.stack_record = [self.data_record]
+
         for instruction in pattern_parse(pattern):
             tok = instruction[0]
             self.tok = tok
@@ -523,61 +546,106 @@ class Extractor(Tool):
             method_name = 'handle_'+directive.name.lower()
             method = getattr(self,method_name)
             method(*args)
+        return self.data_record
+
+    def finalize(self):
         if len(self.stack_record) > 1:
             raise NestingError('There exists a "[" with no matching "]"')
         elif len(self.stack_record) < 1:
             raise NestingError('There exists a "]" with no matching "["')
-    def results(self):
-        return self.data_extraction
+        self.flat_pattern = ''.join(self.flat_pattern)
 
     def handle_value(self,num_bits,encoding):
-        uint_value,num_extracted = self.bits.read(num_bits,reverse=self.reverse_all,invert=self.invert_all)
+        if self.reverse_all:
+            self.bits_io_obj.reverse(num_bits)
+        if self.invert_all:
+            self.bits_io_obj.invert(num_bits)
+        uint_value,num_extracted = self.bits_io_obj.read(num_bits)
         if num_extracted != num_bits:
             raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
         value = uint_decode(uint_value,num_bits,encoding)
+
         self.stack_record[-1].append(value)
-        self.stack_extraction[-1].append(value)
+        self.stack_data[-1].append(value)
         self.last_value = value
+
+        self.flat_pattern.append('.')
+        self.flat_list.append(value)
+        self.flat_labels.append(None)
+        self.flat_pos += 1
+        self.last_index_stack = tuple(self.index_stack)
+        self.index_stack[-1] += 1
         return value
+
+    def handle_takeall(self):
+        if self.reverse_all:
+            self.bits_io_obj.reverse()
+        if self.invert_all:
+            self.bits_io_obj.invert()
+        bytes_data,first_byte_value,first_byte_bits = self.bits_io_obj.read_bytes()
+        values = [first_byte_value,first_byte_bits,bytes_data]
+        self.stack_record[-1].append(values)
+        self.stack_data[-1].append(values)
+        self.last_value = bytes_data
+        self.flat_pattern.extend('[...]')
+        self.flat_list.extend(values)
+        self.flat_labels.extend([None,None,None])
+        self.flat_pos += 3
+        self.last_index_stack = tuple(self.index_stack)
+        self.index_stack[-1] += 1
+        return value
+
     def handle_next(self,num_bits):
-        self.bits.seek(num_bits,SEEK_CUR)
+        self.bits_io_obj.seek(num_bits,SEEK_CUR) #these bits are don't cares
+
     def handle_zeros(self,num_bits):
-        value,num_extracted = self.bits.read(num_bits,reverse=self.reverse_all,invert=self.invert_all)
+        if self.reverse_all:
+            self.bits_io_obj.reverse(num_bits)
+        if self.invert_all:
+            self.bits_io_obj.invert(num_bits)
+        value,num_extracted = self.bits_io_obj.read(num_bits)
         if num_extracted != num_bits:
             raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
         if value != 0:
             raise ZerosError('Token = %s; Expected all zeros; Extracted value = %d' % (self.tok,value))
 
     def handle_ones(self,num_bits):
-        value,num_extracted = self.bits.read(num_bits,reverse=self.reverse_all,invert= not self.invert_all)
+        if self.reverse_all:
+            self.bits_io_obj.reverse(num_bits)
+        if self.invert_all:
+            self.bits_io_obj.invert(num_bits)
+        value,num_extracted = self.bits_io_obj.read(num_bits)
         if num_extracted != num_bits:
             raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
-        if value != 0:
-            raise OnesError('Token = %s; Expected all ones (inversion to be all zeros); Inversion of extracted value = %d' % (self.tok,value))
+        all_ones = (1<<num_bits)-1
+        if value != all_ones:
+            raise OnesError('Token = %s; Expected all ones (%d); Extracted value = %d' % (self.tok,all_ones,value))
+
     def handle_mod(self,num_bits,modtype):
         if modtype == ModType.REVERSE:
-            self.bits.reverse(num_bits)
+            self.bits_io_obj.reverse(num_bits)
         elif modtype == ModType.INVERT:
-            self.bits.invert(num_bits)
+            self.bits_io_obj.invert(num_bits)
         elif modtype == ModType.ENDIANSWAP:
             pos = self.tell()
-            self.bits.reverse(num_bits)
+            self.bits_io_obj.reverse(num_bits)
             for i in range(0,num_bits,8):
-                self.bits.reverse(8)
+                self.bits_io_obj.reverse(8)
                 self.seek(8,SEEK_CUR)
             self.seek(pos)
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
+
     def handle_modoff(self,offset_bits,num_bits,modtype):
-        pos = self.bits.tell()
-        self.bits.seek(offset_bits,SEEK_CUR)
+        pos = self.bits_io_obj.tell()
+        self.bits_io_obj.seek(offset_bits,SEEK_CUR)
         if modtype == ModType.REVERSE:
-            self.bits.reverse(num_bits)
+            self.bits_io_obj.reverse(num_bits)
         elif modtype == ModType.INVERT:
-            self.bits.invert(num_bits)
+            self.bits_io_obj.invert(num_bits)
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
-        self.bits.seek(pos)
+        self.bits_io_obj.seek(pos)
 
     def handle_modset(self,modtype,setting):
         if modtype == ModType.REVERSE:
@@ -603,105 +671,63 @@ class Extractor(Tool):
 
     def handle_setlabel(self,label):
         self.labels[label] = self.last_value
+        if not label in self.labels:
+            self.labels[label] = []
+        self.labels[label].append((self.last_value,self.last_index_stack,self.flat_pos-1))
+        self.flat_labels[-1] = label
+
     def handle_deflabel(self,label,value):
-        self.labels[label] = value
+        if not label in self.labels:
+            self.labels[label] = []
+        self.labels[label].append((self.last_value,None,None))
+
     def handle_matchlabel(self,label):
         if not label in self.labels:
             raise MatchLabelError('Token = %s; Label "%s" does not exist' % (self.tok,label))
-        if self.last_value != self.labels[label]:
-            raise MatchLabelError('Token = %s; Last value of %s does not match value associated with Label "%s": %s ' % (self.tok,repr(self.last_value),label,repr(self.labels[label])))
+        if self.last_value != self.labels[label][-1][0]:
+            raise MatchLabelError('Token = %s; Last value of %s does not match value associated with Label "%s": %s ' % (self.tok,repr(self.last_value),label,repr(self.labels[label][-1][0])))
+
     def handle_nestopen(self):
         new_record = []
         self.stack_record[-1].append(new_record) #embed new record into the previous record
         self.stack_record.append(new_record) #make the new record the active record being worked on
         self.stack_extraction[-1].append(new_record) #embed new record into the previous record
         self.stack_extraction.append(new_record) #make the new record the active record being worked on
+        self.flat_pattern.append('[')
+        self.index_stack.append(0)
+
     def handle_nestclose(self):
         if len(self.stack_record) == 0:
             raise NestingError('there exists a "]" with no matching "["')
         self.stack_record.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
         self.stack_extraction.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
+        self.flat_pattern.append(']')
+        self.index_stack.pop(-1)
+        self.index_stack[-1] += 1
 
     def handle_assertion(self,value):
         if self.last_value != value:
             raise AssertionError('Token = %s; Expected value = %s; Extracted value = %s' % (self.tok,repr(value),repr(self.last_value)))
-    def handle_takeall(self):
-        value = self.bits.read_bytes(reverse=self.reverse_all,invert=self.invert_all)
-        self.stack_record[-1].append(value)
-        self.stack_extraction[-1].append(value)
-        self.last_value = value
-        return value
-
-def flatten(data_obj):
-    """
-    The flatten function takes a nested data structure (list of lists of lists etc) and returns a flattened version of it (list of values) as well as a flatten pattern that stores the nesting information.
-
-    >>> flatten([1,'abc',[0,[1,1,[5]],'def'],9,10,11])
-    ([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '[..[.[..[.]].]...]')
-    """
-    flat = []
-    pattern = ['[']
-    stack = [[data_obj,0]]
-    while len(stack) > 0:
-        target,pos = stack[-1]
-        if pos >= len(target):
-            stack.pop(-1)
-            pattern.append(']')
-        else:
-            item = target[pos]
-            stack[-1][1] += 1
-            if isinstance(item,(list,tuple)):
-                stack.append([item,0])
-                pattern.append('[')
-            else:
-                flat.append(item)
-                pattern.append('.')
-    return flat,''.join(pattern)
-def deflatten(flat,pattern):
-    """
-    The deflatten function takes a flat data structure (list of values) and a flatten pattern, and produces a nested data structure according to those inputs.
-    This is the inverse function of flatten()
-    >>> deflatten([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '[..[.[..[.]].]...]')
-    [1, 'abc', [0, [1, 1, [5]], 'def'], 9, 10, 11]
-    """
-    if pattern[0] != '[':
-        raise Exception('All valid flatten patterns must start with "["')
-    pattern = pattern[1:]
-    data_obj = []
-    stack = [data_obj]
-    pos = 0
-    for token in pattern:
-        if token == '[':
-            new_record = []
-            stack[-1].append(new_record)
-            stack.append(new_record)
-        elif token == ']':
-            stack.pop(-1)
-        elif token == '.':
-            stack[-1].append(flat[pos])
-            pos += 1
-    return data_obj
-
-        
 
 class Constructor(Tool):
     """
     The Constructor class takes a sequence of values (nested or not), and constructs a byte sequence according to provided patterns.
     """
-    def __init__(self,data_obj,labels=None):
+    def __init__(self,data_obj):
         self.data_obj = data_obj
 
         #Simply flatten the data obj. The order of traversal is what is important, not the structure.
-        self.flat,self.flat_pattern = flatten(data_obj)
+        self.flat_list,self.flat_pattern = flatten(data_obj)
+        self.flat_labels = [None]*len(self.flat_list)
         self.flat_pos = 0
+        self.index_stack = [0]
         self.reverse_all = False
         self.invert_all = False
         self.last_value = None
-        self.bytes_obj = io.BytesIO()
-        self.bits = bits_io.BitsIO(bytes_obj)
-        if labels is None:
-            labels = {}
-        self.labels = labels
+        self.last_index_stack = None
+        self.bytes_io_obj = io.BytesIO()
+        self.bits_io_obj = bits_io.BitsIO(bytes_obj)
+        self.labels = {}
 
     def __call__(self,pattern):
         self.data_record = []
@@ -714,6 +740,14 @@ class Constructor(Tool):
             method_name = 'handle_'+directive.name.lower()
             method = getattr(self,method_name)
             method(*args)
+        return self.data_record
+
+    def finalize(self):
+        if len(self.stack) > 1:
+            raise NestingError('There exists a "[" with no matching "]"')
+        elif len(self.stack) < 1:
+            raise NestingError('There exists a "]" with no matching "["')
+
         #perform mod operations in reverse
         #   This works because there is no pattern ability to seek backwards or to an absolute position
         #   and because mod opererations modify positions in front of them without moving the seek position.
@@ -725,50 +759,80 @@ class Constructor(Tool):
         #   then performing all extraction operations. In construction context, this means that all construction
         #   operations can happen first without regard to mod operations happening, then performing all mod
         #   operations in reverse order to construct the original sequence of bits.
-        pos = self.bits.tell()
+        pos = self.bits_io_obj.tell()
         for tok,modtype,start,num_bits in self.mod_operations[::-1]:
-            self.bits.seek(start)
+            self.bits_io_obj.seek(start)
             if modtype == ModType.REVERSE:
-                self.bits.reverse(num_bits)
+                self.bits_io_obj.reverse(num_bits)
             elif modtype == ModType.INVERT:
-                self.bits.invert(num_bits)
+                self.bits_io_obj.invert(num_bits)
             else:
                 raise Exception('Token = %s; Invalid modtype: %s' % (tok,repr(modtype)))
-        self.bits.seek(pos)
-        if len(self.stack) > 1:
-            raise NestingError('There exists a "[" with no matching "]"')
-        elif len(self.stack) < 1:
-            raise NestingError('There exists a "]" with no matching "["')
-        return self.data_record
-    def results(self):
-        return self.bytes_obj
+        self.bits_io_obj.seek(pos)
             
     def handle_value(self,num_bits,encoding):
-        value = self.flat[self.flat_pos]
+        value = self.flat_list[self.flat_pos]
         self.flat_pos += 1
         self.data_record.append(value)
         uint_value = uint_encode(value,num_bits,encoding)
-        self.bits.write(uint_value,num_bits,reverse=self.reverse_all,invert=self.invert_all)
+        pos = self.bits_io_obj.tell()
+        if self.reverse_all:
+            self.mod_operations.append(None,ModType.REVERSE,pos,num_bits)
+        if self.invert_all:
+            self.mod_operations.append(None,ModType.INVERT,pos,num_bits)
+        self.bits_io_obj.write(uint_value,num_bits)
         self.last_value = value
+        self.last_index_stack = tuple(self.index_stack)
+        self.index_stack[-1] += 1
+
+    def handle_takeall(self):
+        first_byte_value,first_byte_bits,bytes_data = self.flat_list[self.flat_pos:self.flat_pos+3]
+        self.flat_pos += 3
+        self.data_record.append([first_byte_value,first_byte_bits,bytes_data])
+        pos = self.bits_io_obj.tell()
+        if self.reverse_all:
+            self.mod_operations.append(None,ModType.REVERSE,pos,None)
+        if self.invert_all:
+            self.mod_operations.append(None,ModType.INVERT,pos,None)
+        self.bits_io_obj.write_bytes(bytes_data,first_byte_value,first_byte_bits)
+        self.last_value = bytes_data
+        self.last_index_stack = tuple(self.index_stack)
+        self.index_stack[-1] += 1
+
     def handle_next(self,num_bits):
-        self.bits.seek(num_bits,SEEK_CUR)
+        #bits are don't care - no reversals or inversions
+        self.bits_io_obj.write(0,num_bits)
+
     def handle_zeros(self,num_bits):
-        self.bits.write(0,num_bits,reverse=self.reverse_all,invert=self.invert_all)
+        if self.reverse_all:
+            self.mod_operations.append(None,ModType.REVERSE,pos,num_bits)
+        if self.invert_all:
+            self.mod_operations.append(None,ModType.INVERT,pos,num_bits)
+
+        self.bits_io_obj.write(0,num_bits)
+
     def handle_ones(self,num_bits):
-        self.bits.write(0,num_bits,reverse=self.reverse_all,invert=not self.invert_all)
+        if self.reverse_all:
+            self.mod_operations.append(None,ModType.REVERSE,pos,num_bits)
+        if self.invert_all:
+            self.mod_operations.append(None,ModType.INVERT,pos,num_bits)
+        all_ones = (1<<num_bits)-1
+        self.bits_io_obj.write(all_ones,num_bits)
+
     def handle_mod(self,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
         if modtype == ModType.REVERSE or modtype == ModType.INVERT:
-            self.mod_operations.append((self.tok,mod_type,self.bits.tell(),num_bits))
+            self.mod_operations.append((self.tok,mod_type,self.bits_io_obj.tell(),num_bits))
         elif modtype == ModType.ENDIANSWAP:
-            pos = self.bits.tell()
+            pos = self.bits_io_obj.tell()
             self.mod_operations.append((self.tok,ModType.REVERSE,pos,num_bits))
             for i in range(0,num_bits,8):
                 self.mod_operations.append((self.tok,ModType.REVERSE,pos+i,8))
 
     def handle_modoff(self,offset_bits,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
-        self.mod_operations.append((self.tok,mod_type,self.bits.tell()+offset_bits,num_bits))
+        self.mod_operations.append((self.tok,mod_type,self.bits_io_obj.tell()+offset_bits,num_bits))
+
     def handle_modset(self,modtype,setting):
         if modtype == ModType.REVERSE:
             if setting == Setting.TRUE:
@@ -790,41 +854,54 @@ class Constructor(Tool):
                 raise Exception('Token = %s; Invalid setting: %s' % (self.tok,repr(setting)))
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
+
     def handle_setlabel(self,label):
-        self.labels[label] = self.last_value
+        if not label in self.labels:
+            self.labels[label] = []
+        self.labels[label].append((self.last_value,self.last_index_stack,self.flat_pos-1))
+
     def handle_deflabel(self,label,value):
-        self.labels[label] = value
+        self.labels[label].append((value,None,None))
+
     def handle_matchlabel(self,label):
         if not label in self.labels:
             raise MatchLabelError('Token = %s; Label "%s" does not exist' % (self.tok,label))
-        if self.last_value != self.labels[label]:
-            raise MatchLabelError('Token = %s; Last value of %s does not match value associated with Label "%s": %s ' % (self.tok,repr(self.last_value),label,repr(self.labels[label])))
+        if self.last_value != self.labels[label][-1][0]:
+            raise MatchLabelError('Token = %s; Last value of %s does not match value associated with Label "%s": %s ' % (self.tok,repr(self.last_value),label,repr(self.labels[label][-1][0])))
+
     def handle_nestopen(self):
         new_record = []
         self.stack[-1].append(new_record) #embed new record into the previous record
         self.stack.append(new_record) #make the new record the active record being worked on
+        self.index_stack.append(0)
+
     def handle_nestclose(self):
         if len(self.stack) == 0:
             raise nestingerror('there exists a "]" with no matching "["')
         self.stack.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
+        self.index_stack.pop(-1)
+        self.index_stack[-1] += 1
 
     def handle_assertion(self,value):
         if self.last_value != value:
             raise AssertionError('Token = %s; Expected value = %s; Extracted value = %s' % (self.tok,repr(value),repr(self.last_value)))
-    def handle_takeall(self):
-        value = self.flat[self.flat_pos]
-        self.flat_pos += 1
-        self.data_record.append(value)
-        self.bits.write_remaining_bytes(value)
-        self.last_value = value
 
-def extract(bytes_obj,blueprint_func):
-    tool = Extractor(bytes_obj)
+def extract(blueprint_func,bytes_io_obj):
+    tool = Extractor(bytes_io_obj)
     blueprint_func(tool)
-    return tool.results()
+    tool.finalize()
+    return tool
 
-def construct(data_obj,blueprint_func):
+def extract_data(blueprint_func,bytes_io_obj):
+    tool = extract(blueprint_func,bytes_io_obj)
+    return tool.data_obj
+
+def construct(blueprint_func,data_obj):
     tool = Constructor(data_obj)
     blueprint_func(tool)
-    return tool.results()
+    tool.finalize()
+    return tool
 
+def construct_bytes(data_obj,blueprint_func):
+    tool = construct(blueprint_func,data_obj)
+    return bytes(tool)
