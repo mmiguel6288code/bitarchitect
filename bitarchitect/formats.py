@@ -76,7 +76,7 @@ def from_b2(b):
             val = 0
     return bytes(result)
     
-from_hex = from_b16
+from_hex = lambda s: from_b16(s,True)
 from_oct = from_b8
 from_bin = from_b2
 

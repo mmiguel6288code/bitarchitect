@@ -77,9 +77,16 @@ These tables are precalculated to be used in the functions within this module
 """
 reverse_byte_table = {value:reverse_uint(value,8) for value in range(256)}
 invert_byte_table = {value:invert_uint(value,8) for value in range(256)}
+def reverse_bytes(b):
+    return b''.join([reverse_byte_table[x] for x in b[::-1]])
+def invert_bytes(b):
+    return b''.join([invert_byte_table[x] for x in b])
+
 SEEK_SET = io.SEEK_SET
 SEEK_CUR = io.SEEK_CUR
 SEEK_END = io.SEEK_END
+def ones_block(length,lshift=0):
+    return ((1<<length)-1)<<lshift
 
 def lmask_byte(num_mask_bits,value):
     """
@@ -118,7 +125,6 @@ def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
     >>> bytes_to_uint(b'hello world')
     (126207244316550804821666916, 88)
     """
-    byte_data = list(byte_data)
     num_bits = len(byte_data)*8-lstrip-rstrip
     n = len(byte_data)
     if invert:
@@ -246,7 +252,7 @@ def uint_to_bytes(uint,num_bits=None,loffset=0,lvalue=0,rvalue=0,reverse=False,i
         byte_data[0] = lmask_byte(last_byte_lmask,byte_data[0]) | rmask_byte(roffset,rvalue)
 
     #reverse the bytes
-    return bytes(byte_data[::-1])
+    return bytearray(byte_data[::-1])
 
 
 class BitsIO(object):
@@ -291,22 +297,31 @@ class BitsIO(object):
 
         If initialized with a file-like object, the file object should be opened in binary mode. The mode property will be set to the mode of the file object if it exists, otherwise it will be "rb+". The seek position will correspond to the first bit (MSB) of the current byte of the file-like object.
         """
+        self.original_byte_source = byte_source
         #if provided None, create an empty BytesIO object
         if byte_source is None:
             self.byte_source = io.BytesIO()
             self.mode = 'rb+'
         #if provided a bytes object, wrap it in a BytesIO object to make a mutable copy
-        if isinstance(byte_source,bytes):
+        if isinstance(byte_source,(bytes,bytearray,memoryview)):
             self.byte_source = io.BytesIO(byte_source)
             self.mode = 'rb+'
-        elif isinstance(byte_source,(io.BufferedIOBase,io.BufferedRandom,io.BytesIO)):
+        elif isinstance(byte_source,(io.BufferedIOBase,io.BufferedRandom,io.BufferedReader,io.BytesIO)):
             if hasattr(byte_source,'mode'):
                 if not 'b' in byte_source.mode:
                     raise Exception('File-like object provided to BitsIO must be opened in binary mode i.e. must have "b": mode = %s' % byte_source.mode)
-                self.mode = byte_source.mode
+                if not '+' in byte_source.mode:
+                    pos = byte_source.tell()
+                    byte_source.seek(0)
+                    self.byte_source = io.BytesIO(byte_source.read())
+                    self.byte_source.seek(pos)
+                    byte_source.seek(pos)
+                    self.mode = 'rb+'
+                else:
+                    self.byte_source = byte_source
+                    self.mode = byte_source.mode
             else:
                 self.mode = 'rb+'
-            self.byte_source = byte_source
         else:
             raise Exception('Invalid object for BitsIO byte_source: %s' % repr(type(byte_source)))
         self.bit_seek_pos = self.byte_source.tell()*8
@@ -386,10 +401,8 @@ class BitsIO(object):
         """
 
         #divmod handles positive and negative offsets correctly
-
         offset_bytes, remainder_bits = divmod(offset_bits,8)
-        if offset_bytes != 0:
-            self.byte_source.seek(offset_bytes,whence)
+        self.byte_source.seek(offset_bytes,whence)
         self.bit_seek_pos = self.byte_source.tell()*8 + remainder_bits
         return self.bit_seek_pos
         
@@ -529,7 +542,7 @@ class BitsIO(object):
         else:
             first_byte = 0
         last_byte_lmask = ((loffset + n)%8)
-        roffset = 8 - last_byte_lmask
+        roffset = (8 - last_byte_lmask)%8
         if roffset > 0:
             self.byte_source.seek(last_byte_pos)
             last_byte = list(self.byte_source.read(1))[0]
@@ -546,7 +559,7 @@ class BitsIO(object):
         """
         start_pos = self.tell()
         value,num_bits = self.read(n)
-        value = reverse_uint(num_bits)
+        value = reverse_uint(value,num_bits)
         self.seek(start_pos)
         self.write(value,num_bits)
         self.seek(start_pos)
@@ -557,7 +570,7 @@ class BitsIO(object):
         """
         start_pos = self.tell()
         value,num_bits = self.read(n)
-        value = invert_uint(num_bits)
+        value = invert_uint(value,num_bits)
         self.seek(start_pos)
         self.write(value,num_bits)
         self.seek(start_pos)
@@ -586,7 +599,7 @@ class BitsIO(object):
         first_value = rmask_byte(rmask,rest[0])
         self.seek(0,io.SEEK_END)
         return (first_value,rmask,rest[1:])
-    def write_bytes(self,bytes_data,first_byte_value,first_byte_bits=None):
+    def write_bytes(self,bytes_data,first_byte_value=None,first_byte_bits=None):
         """
         Writes bytes.
         To account for the situation of the current seek position being in the middle of a byte, the integer value of that first value and the number of bits can be supplied. The number of bits, if provided, will be validated against the current seek position.
@@ -603,4 +616,20 @@ class BitsIO(object):
         self.byte_source.write(bytes_data)
         self.seek(0,io.SEEK_END)
         
+    def find(self,sub):
+        """
+        Finds a byte substring relative to the current seek position
+        """
+        pos = self.tell()
+        if pos % 8 != 0:
+            raise Exception('find() method requires bit position to be a multiple of 8')
+        byte_pos = pos//8
+        if hasattr(self.byte_source,'getbuffer'):
+            data = bytes(self.byte_source.getbuffer())[byte_pos:]
+        else:
+            data = self.byte_source.read()
+            self.byte_source.seek(byte_pos)
+        byte_offset = data.find(sub)
+        bit_offset = byte_offset*8
+        return bit_offset
 
