@@ -110,7 +110,7 @@ def rmask_byte(num_mask_bits,value):
 
 
 
-def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
+def bytes_to_uint(bytes_data,lstrip=0,rstrip=0,reverse=False,invert=False):
     """
     This function takes a bytes object and converts it into a single unsigned integer. It assumes a Big Endian interpretation (first byte is more significant than last byte).
     
@@ -125,17 +125,18 @@ def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
     >>> bytes_to_uint(b'hello world')
     (126207244316550804821666916, 88)
     """
-    num_bits = len(byte_data)*8-lstrip-rstrip
-    n = len(byte_data)
+    bytes_data = bytearray(bytes_data)
+    num_bits = len(bytes_data)*8-lstrip-rstrip
+    n = len(bytes_data)
     if invert:
         #flip the value of all bytes
-        byte_data = [invert_byte_table[value] for value in byte_data]
+        bytes_data = [invert_byte_table[value] for value in bytes_data]
     if lstrip > 0:
-        if lstrip <= len(byte_data)*8:
+        if lstrip <= len(bytes_data)*8:
             lstrip_bytes,lstrip = divmod(lstrip,8)
-            byte_data = byte_data[lstrip_bytes:] #remove bytes from the front
-            if len(byte_data) > 0:
-                byte_data[0] = rmask_byte(8-lstrip,byte_data[0]) #strip off bits in the first byte
+            bytes_data = bytes_data[lstrip_bytes:] #remove bytes from the front
+            if len(bytes_data) > 0:
+                bytes_data[0] = rmask_byte(8-lstrip,bytes_data[0]) #strip off bits in the first byte
         else:
             raise Exception('lstrip value of %d exceeded number of bits in bytes object (%d)' % (lstrip,len(bytes_data*8)))
 
@@ -145,9 +146,9 @@ def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
     if rstrip > 0:
         if rstrip <= len(bytes_data)*8:
             rstrip_bytes, rstrip = divmod(rstrip, 8)
-            byte_data = byte_data[:-rstrip_bytes] #remove bytes from the end
+            bytes_data = bytes_data[:-rstrip_bytes] #remove bytes from the end
             if len(bytes_data) > 0:
-                byte_data[-1] = lmask_byte(8-rstrip,byte_data[-1]) #strip of bits in the last byte
+                bytes_data[-1] = lmask_byte(8-rstrip,bytes_data[-1]) #strip of bits in the last byte
         else:
             raise Exception('rstrip value of %d exceeded number of bits in bytes object (%d)' % (rstrip,len(bytes_data*8)))
     elif rstrip < 0:
@@ -155,8 +156,8 @@ def bytes_to_uint(byte_data,lstrip=0,rstrip=0,reverse=False,invert=False):
     
     if reverse:
         #reverse the order across bytes and reverse the order of bits within bytes
-        byte_data =[reverse_byte_table[value] for value in byte_data[::-1]]
-    result = sum((b<<(8*(n-p-1))) for p,b in enumerate(byte_data))
+        bytes_data =[reverse_byte_table[value] for value in bytes_data[::-1]]
+    result = sum((b<<(8*(n-p-1))) for p,b in enumerate(bytes_data))
     if not reverse:
         return (result >> rstrip,num_bits)
     else:
@@ -230,29 +231,29 @@ def uint_to_bytes(uint,num_bits=None,loffset=0,lvalue=0,rvalue=0,reverse=False,i
             roffset += 8
 
     #extract byte data from uint
-    byte_data = []
+    bytes_data = []
     for byte_i in range(num_bytes):
         uint,value = divmod(uint,256)
-        byte_data.append(value)
+        bytes_data.append(value)
     #perform reversal if requested
     if reverse:
-        byte_data =[reverse_byte_table[value] for value in byte_data[::-1]]
+        bytes_data =[reverse_byte_table[value] for value in bytes_data[::-1]]
     #perform inversion if requested
     if invert:
-        byte_data = [invert_byte_table[value] for value in byte_data]
+        bytes_data = [invert_byte_table[value] for value in bytes_data]
 
     #replace the loffset MSBs of the byte that will ultimately be the first byte (but is currently the last byte) with the MSBs from lvalue
     if loffset > 0:
         first_byte_rmask = 8-loffset
-        byte_data[-1] = rmask_byte(first_byte_rmask,byte_data[-1]) | lmask_byte(loffset,lvalue)
+        bytes_data[-1] = rmask_byte(first_byte_rmask,bytes_data[-1]) | lmask_byte(loffset,lvalue)
     
     #replace the roffset LSBs of the byte that will ultimately be the last byte (but is currently the first byte) with the LSBs from rvalue
     if roffset > 0:
         last_byte_lmask = 8-roffset
-        byte_data[0] = lmask_byte(last_byte_lmask,byte_data[0]) | rmask_byte(roffset,rvalue)
+        bytes_data[0] = lmask_byte(last_byte_lmask,bytes_data[0]) | rmask_byte(roffset,rvalue)
 
     #reverse the bytes
-    return bytearray(byte_data[::-1])
+    return bytes(bytes_data[::-1])
 
 
 class BitsIO(object):
@@ -495,8 +496,8 @@ class BitsIO(object):
             lstrip = end_remainder_bits
         else:
             raise Exception('Provided value not comparable to zero: %s' % repr(n))
-        byte_data = self.byte_source.read(num_bytes)
-        value,num_bits = bytes_to_uint(byte_data,lstrip,rstrip,reverse,invert)
+        bytes_data = self.byte_source.read(num_bytes)
+        value,num_bits = bytes_to_uint(bytes_data,lstrip,rstrip,reverse,invert)
         self.seek(end_pos)
         return value,num_bits
 
@@ -549,8 +550,8 @@ class BitsIO(object):
         else:
             last_byte = 0
         self.byte_source.seek(first_byte_pos)
-        byte_data = uint_to_bytes(value,n,loffset,first_byte,last_byte,reverse,invert)
-        self.byte_source.write(byte_data)
+        bytes_data = uint_to_bytes(value,n,loffset,first_byte,last_byte,reverse,invert)
+        self.byte_source.write(bytes_data)
         self.seek(end_pos)
     def reverse(self,n=None):
         """

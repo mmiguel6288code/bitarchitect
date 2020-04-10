@@ -47,6 +47,8 @@ import base64, math
 from_b64 = base64.b64decode
 from_b32 = base64.b32decode
 from_b16 = base64.b16decode
+#from .bits_io import uint_to_bytes, bytes_to_uint
+from .pattern import uint_encode, uint_decode, Encoding
 def from_b8(b):
     if len(b) % 4 != 0:
         raise Exception('Octal b8 encoded strings must be a multiple of 4 bytes. Check that the "=" padding characters at the end are correct.')
@@ -79,6 +81,9 @@ def from_b2(b):
 from_hex = lambda s: from_b16(s,True)
 from_oct = from_b8
 from_bin = from_b2
+
+
+
 
 to_b64 = base64.b64encode
 to_b32 = base64.b32encode
@@ -134,3 +139,15 @@ def to_HEX(b):
 to_oct = to_b8
 to_bin = to_b2
 
+
+
+def from_uint(uint,num_bits):
+    return uint_decode(uint,num_bits,Encoding.BYTS)
+def to_uint(b):
+    return uint_encode(b,len(b)*8,Encoding.BYTS)
+
+def from_sint(sint,num_bits):
+    return uint_decode(uint_encode(sint,num_bits,Encoding.SINT),num_bits,Encoding.BYTS)
+def to_sint(b):
+    num_bits = len(b)*8
+    return uint_encode(uint_decode(b,num_bits,Encoding.BYTS),num_bits,Encoding.SINT)

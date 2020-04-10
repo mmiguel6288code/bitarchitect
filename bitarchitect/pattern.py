@@ -7,13 +7,32 @@ A blueprint can be either a string or a function with a specific signature.
 A string blueprint is interpreted as a parsing pattern and can be used when the bit structure is fixed and no conditional branching or loops are required to extract the data.
 Otherwise, a function blueprint is used. A function blueprint receives a single argument, by convention, called a tool. The tool may be an instance of either an Extractor class or a Constructor class. The former is used for extracting binary data to python variables. The latter is used for constructing binary data from python variables. From the perspective of designing the blueprint, it does not matter which of the two the tool is when the blueprint function is called. The tool is called with parsing patterns. Different patterns can be applied depending on conditionals and loops in normal python within the blueprint function.
 
+
+Tool variables:
+    bits_io_obj = Bits buffer
+    data_obj = data with structured nesting
+    data_flat = flat data
+
+Special tool methods:
+    tell(): Specifies the current bit position in the buffer being read/written to
+
+    tell_orig(): Takes the current bit position in the buffer and translates that position to where it would be in the original file. This can differ from tell() if operations such as reversals, pulls, jumps, or endian swaps have been performed.
+
+    index_list(): Returns the list of indices indicating where the next item to be inserted into/taken from the data structure is.
+        For example if the result is [0,3,1], then the next item will be inserted/taken at data_obj[0][3][1]
+
+    index_flat(): Returns the single index number indicating where the next item will be inserted into/taken from the flattened data.
+        For example, if the result is 201, then the next item will be inserted/taken at data_flat[201]
+        
+
 For parsing pattern documentation, see the docstring for the pattern_parse() function.
 """
 import re, ast, io, struct
 from enum import Enum
 from math import ceil
 from .bits_io import SEEK_SET, SEEK_CUR, SEEK_END, uint_to_bytes, bytes_to_uint, BitsIO, reverse_bytes, invert_bytes
-from .formats import from_hex
+from base64 import b16decode
+import logarhythm
 
 class Directive(Enum):
     """
@@ -34,6 +53,7 @@ class Directive(Enum):
     ASSERTION = 13 #args = (value,)
     TAKEALL = 14 #args = (,)
     MARKER = 15 #args = (byte_literal)
+    JUMP = 16 #args = (num_bits,jump_type)
 
 class Encoding(Enum):
     """
@@ -66,6 +86,14 @@ class Setting(Enum):
     TRUE=1
     TOGGLE=2
 
+class JumpType(Enum):
+    """
+    This enumeration defines the modify types available for MOD and MODSET directives
+    """
+    START=1
+    FORWARD=2
+    BACKWARD=3
+    END=4
 
 def pattern_parse(pattern):
     """
@@ -108,6 +136,7 @@ def pattern_parse(pattern):
     Setting tokens:
         R<t|y|n>  = Reverse all setting. When enabled, each read is preceded by a reversal for the same number of bits. e.g. u<n> is treated as r<n>u<n>
         I<t|y|n> = Invert all setting. When enabled, each read is preceded by an inversion for the same number of bits. e.g. u<n> is treated as i<n>u<n>
+        E<t|y|n> = Endian-swap all setting. When enabled, each read is preceded by an endian swap. A read that is not a multiple of 8 bits will generate an exception. 
 
     Non-value consuming tokens:
         z<n> = Represents a sequence of zeros n bits long
@@ -135,17 +164,39 @@ def pattern_parse(pattern):
         p<m>.<n> = Pulls the block of data offset that is forward by m bits and is length n to the current seek position. Equivalent to r<m+n> r<n> r<m>.<n>
         p<m>.! = Sets n to correspond to the remainder of the data following the m offset.
             Equivalent to calculating the full stream length L and setting n = L-m, then performing p<m>.<n>. Inserts the computed n value into the data structure, which is used for construction.
+        In construction mode, the reversal steps are performed in reverse, which effectively results in pushing the final result to the original location it is to be pulled from.
+
+    Jump:
+        These commands jump based on original bit position in the file. This is implemented as a pull p<m>.! operation where m is calculated based on knowing the modification operations that have been performed.
+        For the relative commands jf and jb, the current buffer position is translated to the original file bit position by iterating through reversal operations in reverse.
+        The provided relative offset (jf = forward = positive offset, jb = backward = negative offset) is applied to the resulting position.
+        For js = start, an absolute original bit position relative to the start of the file is provided.
+        For je = end, an offset prior to the end of the file is provided.
+        In all cases, this target position is re-translated back to where it corresponds to in the current buffer, and the current buffer seek position is subtracted from that to produce a final relative offset value for m.
+        If m is negative, then this means the jump is to a bit that has already been parsed, and an exception will be raised.
+        If m is positive, then the p<m>.! will be performed.
+        js<n> = Jump to a position corresponding to a forward offset of n relative to the start according to the original bit ordering of the file/bit stream
+        jf<n> = Jump to a position corresponding to a forward offset of n relative to the current position according to the original bit ordering of the file/bit stream
+        jb<n> = Jump to a position corresponding to a backward offset of n relative to the current position according to the original bit ordering of the file/bit stream
+        je<n> = Jump to a position corresponding to a backward offset of n relative to the end according to the original bit ordering of the file/bit stream
 
     Marker:
-        m"<hex_literal>" =  In extraction mode, scan forward in bytes until bytes matching the given hex literal is found. When invoked, the current bit seek position must be on a byte boundary (i.e. a multiple of 8).The hex literal must correspond to a whole number of bytes (i.e. an even number of hex characters). When found, the extractor will perform a pull operation on the matched pattern, move the seek position past it, and return a data value equal to the number of bits that were traversed during the scan. If this pattern is found at a bit offset m relative to what was the curret bit seek position, and n is the size in bits of the literal, then this operation is equivalent to p<m>.<n> n<n> and having the value m being inserted into the data structure (extracted list structure). In construction mode, the literal is inserted into the byte stream and pushed using the m value from the data structure. 
+        m"<hex_literal>" =  In extraction mode, scan forward in bytes until bytes matching the given hex literal is found. When invoked, the current bit seek position must be on a byte boundary (i.e. a multiple of 8).The hex literal must correspond to a whole number of bytes (i.e. an even number of hex characters). When found at a forward offset of m bits, the extractor will perform a pull operation p<m>.!, consume the marker bytes from the bit stream and return a data 2-tuple (m,n) where m = number of bits that were traversed during the scan, and n = the total number of bits from the pull operation. 
+        In construction mode, (m,n) are extracted from the data structure to enact the pull operation, and literal is inserted into the byte stream.
+
+
     """
+    logger = logarhythm.getLogger('parse_pattern')
+    logger.format = logarhythm.build_format(time=None,level=False)
+    logger.debug('pattern started')
+    pattern = pattern.strip()
     pos = 0
-    tok_parse = re.compile('\\s*([rip]\\d+\\.(?:\\d+|!)|[usfxXbBnpjJrizo]\\d+|[RI][ynt]|!#"|#["#]|=#"|[\\[\\]=\\{\\}]|[riB]!|m")')
+    tok_parse = re.compile('\\s*([rip]\\d+\\.(?:\\d+|!)|[usfxXbBnpjJrizoe]\\d+|[RIE][ynt]|!#"|#["#]|=#"|[\\[\\]=\\{\\}]|[riB]!|m"|j[sfbe]\\d+)')
     label_parse = re.compile('([^"]+)"')
     space_equals_parse = re.compile('\\s*=')
     expr_parse = re.compile('([^;]+);')
     num_parse = re.compile('\\d+')
-    comment_parse = re.compile('.+\n',re.S)
+    comment_parse = re.compile('.*?$',re.S|re.M)
     hex_parse = re.compile('([A-F0-9a-f]+)\"')
 
     no_arg_codes = {
@@ -158,13 +209,14 @@ def pattern_parse(pattern):
             'n':Directive.NEXT,
             }
     modoff_codes = {
-            'r':(Directive.MOD,ModType.REVERSE),
-            'i':(Directive.MOD,ModType.INVERT),
-            'p':(Directive.MOD,ModType.PULL),
+            'r':(Directive.MODOFF,ModType.REVERSE),
+            'i':(Directive.MODOFF,ModType.INVERT),
+            'p':(Directive.MODOFF,ModType.PULL),
             }
     setting_codes = {
             'R':(Directive.MODSET,ModType.REVERSE),
             'I':(Directive.MODSET,ModType.INVERT),
+            'E':(Directive.MODSET,ModType.ENDIANSWAP),
             }
     num_and_arg_codes = {
             'u':(Directive.VALUE,Encoding.UINT),
@@ -175,6 +227,7 @@ def pattern_parse(pattern):
             'B':(Directive.VALUE,Encoding.BYTS),
             'r':(Directive.MOD,ModType.REVERSE),
             'i':(Directive.MOD,ModType.INVERT),
+            'e':(Directive.MOD,ModType.ENDIANSWAP),
             }
     negate_num_codes = set('Jp')
     setting_map = {
@@ -182,10 +235,18 @@ def pattern_parse(pattern):
             'n':Setting.FALSE,
             't':Setting.TOGGLE,
             }
-
-    tokmatch = tok_parse.match(pattern,pos)
+    jump_codes = {
+            's':JumpType.START,
+            'f':JumpType.FORWARD,
+            'b':JumpType.BACKWARD,
+            'e':JumpType.END,
+            }
 
     repetition_stack = []
+
+    tokmatch = tok_parse.match(pattern,pos)
+    if tokmatch is not None:
+        pos = tokmatch.end(0)
 
     while tokmatch is not None:
         tok = tokmatch.group(1)
@@ -231,74 +292,96 @@ def pattern_parse(pattern):
             n = int(tok[1:])
             instruction = (tok,directive,n)
         elif tok == '#"': #SETLABEL
-            labelmatch = label_parse.match(pattern,pos+2)
+            labelmatch = label_parse.match(pattern,pos)
+            tok += labelmatch.group(0)
             pos = labelmatch.end(0)
             label = labelmatch.group(1)
-            instruction = (tok+labelmatch.group(0),Directive.SETLABEL,label)
+            instruction = (tok,Directive.SETLABEL,label)
         elif tok == '!#"': #DEFLABEL
-            labelmatch = label_parse.match(pattern,pos+3)
+            labelmatch = label_parse.match(pattern,pos)
+            tok += labelmatch.group(0)
             pos = labelmatch.end(0)
             label = labelmatch.group(1)
             space_equals_match = space_equals_parse.match(pattern,pos)
+            tok += space_equals_match.group(0)
             pos = space_equals_match.end(0)
             expr_match = expr_parse.match(pattern,pos)
+            tok += expr_match.group(0)
             pos = expr_match.end(0)
             expr = expr_match.group(1)
-            value = ast.literal_eval(expr)
-            instruction = (tok+labelmatch.group(0) + space_equals_match.group(0) + expr_match.group(0),Directive.DEFLABEL,label,value)
+            value = ast.literal_eval(expr.strip())
+            instruction = (tok,Directive.DEFLABEL,label,value)
 
         elif tok == '=#"': #MATCHLABEL
-            labelmatch = label_parse.match(pattern,pos+3)
+            labelmatch = label_parse.match(pattern,pos)
+            tok += labelmatch.group(0)
             pos = labelmatch.end(0)
             label = labelmatch.group(1)
-            instruction = (tok+labelmatch.group(0),Directive.MATCHLABEL,label)
+            instruction = (tok,Directive.MATCHLABEL,label)
 
         elif tok == '=': #ASSERTION 
             expr_match = expr_parse.match(pattern,pos)
+            tok += expr_match.group(0)
             pos = expr_match.end(0)
             expr = expr_match.group(1)
-            value = ast.literal_eval(expr)
-            instruction = (tok+expr_match.group(0),Directive.ASSERTION,value)
+            value = ast.literal_eval(expr.strip())
+            instruction = (tok,Directive.ASSERTION,value)
         elif tok == '{': #REPETITION CAPTURE START
             new_capture = [None] #first element is how many times to repeat; initialized to None and filled out when capture is complete
             if len(repetition_stack) > 0: #if nested repetition, need to connect previous capture to this new one
                 repetition_stack[-1].append(new_capture)
             repetition_stack.append(new_capture) #new capture is focus now
+            logger.debug('Beginning "{" repetition level %d' % len(repetition_stack))
         elif tok == '}': #REPETITION CAPTURE END
+            logger.debug('Ending "}" repetition level %d' % len(repetition_stack))
             repetition_capture = repetition_stack.pop(-1)
             num_match = num_parse.match(pattern,pos) #collect number
+            tok += num_match.group(0)
             pos = num_match.end(0)
             repetition_capture[0] = int(num_match.group(0)) #population first element with repetition number
             if len(repetition_stack) == 0: #if all repetitions are done
-                yield from _process_repetition_capture(repetition_capture)
+                yield from _process_repetition_capture(repetition_capture,logger)
         elif tok == '##': #COMMENT
             comment_match = comment_parse.match(pattern,pos)
-            pos = expr_match.end(0)
+            tok += comment_match.group(0)
+            pos = comment_match.end(0)
+            logger.debug('Comment: %s' % tok)
         elif tok == 'm"': #MARKER
-                hexmatch = hex_parse.match(pattern,pos+2)
+                hexmatch = hex_parse.match(pattern,pos)
+                tok += hexmatch.group(0)
                 pos = hexmatch.end(0)
                 hex_literal = hexmatch.group(1)
-                byte_literal = from_hex(hex_literal)
-                instruction = (tok+hexmatch.group(0),Directive.MARKER,byte_literal)
-
+                byte_literal = b16decode(hex_literal,True)
+                instruction = (tok,Directive.MARKER,byte_literal)
+        elif code == 'j':
+            code2 = tok[1]
+            num_bits = int(tok[2:])
+            jump_type = jump_codes[code2]
+            instruction = (tok,Directive.JUMP,num_bits,jump_type)
         else:
             raise Exception('Unknown token: %s' % tok)
 
         if instruction is not None:
             if len(repetition_stack) > 0:
+                logger.debug('store rep level %d %s' % (len(repetition_stack),repr(instruction)))
                 repetition_stack[-1].append(instruction)
             else:
+                logger.debug('yield %s' % (repr(instruction)))
                 yield instruction
         tokmatch = tok_parse.match(pattern,pos)
         if tokmatch is not None:
             pos = tokmatch.end(0)
-def _process_repetition_capture(repetition_capture):
+    if pos < len(pattern):
+        raise Exception('Unable to parse pattern after position %d: %s' % (pos,pattern[pos:pos+20]+'...'))
+    logger.debug('pattern completed')
+def _process_repetition_capture(repetition_capture,logger):
     count = repetition_capture[0]
     for iteration in range(count):
         for item in repetition_capture[1:]:
             if isinstance(item,list):
-                yield from _process_repetition_capture(item)
+                yield from _process_repetition_capture(item,logger)
             else:
+                logger.debug('repetition %d yield %s' % (iteration+1,repr(item)))
                 yield item
 
 def uint_decode(uint_value,num_bits,encoding):
@@ -529,11 +612,20 @@ class Tool():
         raise NotImplementedError
         return data_record
     def __getitem__(self,label):
-        self.labels[label][-1][0]
+        return self.labels[label][-1][0]
     def __setitem__(self,label,value):
         self.labels[label].append((value,None,None))
     def __delitem__(self,label):
         del self.labels[label]
+
+    def tell(self):
+        return self.bits_io_obj.tell()
+    def tell_orig(self):
+        return self._translate_to_original(self.tell())
+    def index_list(self):
+        return list(self.index_stack)
+    def index_flat(self):
+        return self.flat_pos
 
 
     def finalize(self):
@@ -544,6 +636,33 @@ class Tool():
 
     def __bytes__(self):
         return bytes(self.bits_io_obj)
+    def _translate_to_original(self,pos):
+        orig_pos = pos
+        for tok, modtype, start, offset, num_bits in self.mod_operations[::-1]:
+            mstart = start + offset
+            mend = mstart + num_bits
+            if modtype == ModType.REVERSE:
+                if mstart <= orig_pos <= mend:
+                    orig_pos = mend - (orig_pos - mstart)
+            elif modtype == ModType.INVERT:
+                pass
+            else:
+                raise Exception('Invalid modtype for _translate_to_original: %s' % modtype)
+        return orig_pos
+
+    def _translate_from_original(self,orig_pos):
+        pos = orig_pos
+        for tok, modtype, start, offset, num_bits in self.mod_operations:
+            mstart = start + offset
+            mend = mstart + num_bits
+            if modtype == ModType.REVERSE:
+                if mstart <= pos <= mend:
+                    pos = mend - (pos - mstart)
+            elif modtype == ModType.INVERT:
+                pass
+            else:
+                raise Exception('Invalid modtype for _translate_to_original: %s' % modtype)
+        return pos
 
 
 class Extractor(Tool):
@@ -554,15 +673,17 @@ class Extractor(Tool):
         self.bytes_io_obj = bytes_io_obj
         self.bits_io_obj = BitsIO(bytes_io_obj)
 
+        #Initialize settings
         self.reverse_all = False
         self.invert_all = False
+        self.endianswap_all = False
 
         self.last_value = None
         self.last_index_stack = None
 
         self.labels = {}
 
-        self.flat_list = []
+        self.data_flat = []
         self.flat_labels = []
         self.flat_pattern = [] #list of characters
         self.flat_pos = 0
@@ -570,6 +691,9 @@ class Extractor(Tool):
 
         self.data_obj = []
         self.stack_data = [self.data_obj]
+        self.mod_operations = [] # tok, modtype, start, offset, num_bits
+        self.logger = logarhythm.getLogger('Extractor')
+        self.logger.format = logarhythm.build_format(time=None,level=False)
 
     def __call__(self,pattern):
         self.data_record = []
@@ -586,152 +710,168 @@ class Extractor(Tool):
         return self.data_record
 
     def finalize(self):
-        if len(self.stack_record) > 1:
+        if len(self.stack_data) > 1:
             raise NestingError('There exists a "[" with no matching "]"')
-        elif len(self.stack_record) < 1:
+        elif len(self.stack_data) < 1:
             raise NestingError('There exists a "]" with no matching "["')
         self.flat_pattern = ''.join(self.flat_pattern)
 
-    def handle_value(self,num_bits,encoding):
+    def _apply_settings(self,num_bits):
+        pos = self.bits_io_obj.tell()
         if self.reverse_all:
             self.bits_io_obj.reverse(num_bits)
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,num_bits))
         if self.invert_all:
             self.bits_io_obj.invert(num_bits)
+            self.mod_operations.append((self.tok,ModType.INVERT,pos,0,num_bits))
+        if self.endianswap_all:
+            self._endianswap(num_bits)
+
+    def _consume_bits(self,num_bits=None,encoding=Encoding.UINT):
+        self._apply_settings(num_bits)
         uint_value,num_extracted = self.bits_io_obj.read(num_bits)
         if num_extracted != num_bits:
             raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
         value = uint_decode(uint_value,num_bits,encoding)
+        return value
 
+    def _insert_data(self,value):
         self.stack_record[-1].append(value)
         self.stack_data[-1].append(value)
         self.last_value = value
-
         self.flat_pattern.append('.')
-        self.flat_list.append(value)
+        self.data_flat.append(value)
         self.flat_labels.append(None)
         self.flat_pos += 1
         self.last_index_stack = tuple(self.index_stack)
         self.index_stack[-1] += 1
+    def _insert_data_record(self,record):
+        l = len(record)
+        self.stack_record[-1].append(record)
+        self.stack_data[-1].append(record)
+        self.last_value = record[-1]
+        self.flat_pattern.extend('['+'.'*l+']')
+        self.data_flat.extend(record)
+        self.flat_labels.extend([None]*l)
+        self.flat_pos += l
+        self.last_index_stack = tuple(self.index_stack)
+        self.index_stack[-1] += 1
+
+    def _endianswap(self,n):
+        if n % 8 != 0:
+            raise Exception('Endian swap must be performed on a multiple of 8 bits: %s' % self.tok)
+        pos = self.bits_io_obj.tell()
+        self.bits_io_obj.reverse(n)
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,n))
+        for i in range(0,n,8):
+            self.bits_io_obj.reverse(8)
+            self.bits_io_obj.seek(8,SEEK_CUR)
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,i,8))
+        self.bits_io_obj.seek(pos)
+
+    def _pull(self,m,n):
+        pos = self.bits_io_obj.tell()
+        if n is None:
+            L = len(self.bits_io_obj)
+            n = L - (pos+m)
+            self._insert_data(n)
+        self.bits_io_obj.reverse(m+n)
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,m+n))
+        self.bits_io_obj.reverse(n)
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,n))
+        self.bits_io_obj.seek(n,SEEK_CUR)
+        self.bits_io_obj.reverse(m)
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,n,m))
+        self.bits_io_obj.seek(pos)
+        return n
+
+
+    def handle_value(self,num_bits,encoding):
+        value = self._consume_bits(num_bits,encoding)
+        self._insert_data(value)
+        self.logger.debug('%s = %r' % (self.tok,value))
         return value
 
     def handle_takeall(self):
-        if self.reverse_all:
-            self.bits_io_obj.reverse()
-        if self.invert_all:
-            self.bits_io_obj.invert()
+        L = len(self.bits_io_obj)
+        num_bits = L - self.bits_io_obj.tell()
+        self._apply_settings(num_bits)
+
         bytes_data,first_byte_value,first_byte_bits = self.bits_io_obj.read_bytes()
         values = [first_byte_value,first_byte_bits,bytes_data]
-        self.stack_record[-1].append(values)
-        self.stack_data[-1].append(values)
-        self.last_value = bytes_data
-        self.flat_pattern.extend('[...]')
-        self.flat_list.extend(values)
-        self.flat_labels.extend([None,None,None])
-        self.flat_pos += 3
-        self.last_index_stack = tuple(self.index_stack)
-        self.index_stack[-1] += 1
-        return value
+        self._insert_record(values)
+        return values
 
     def handle_next(self,num_bits):
         self.bits_io_obj.seek(num_bits,SEEK_CUR) #these bits are don't cares
 
     def handle_zeros(self,num_bits):
-        if self.reverse_all:
-            self.bits_io_obj.reverse(num_bits)
-        if self.invert_all:
-            self.bits_io_obj.invert(num_bits)
-        value,num_extracted = self.bits_io_obj.read(num_bits)
-        if num_extracted != num_bits:
-            raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
+        value = self._consume_bits(num_bits)
         if value != 0:
             raise ZerosError('Token = %s; Expected all zeros; Extracted value = %d' % (self.tok,value))
 
     def handle_ones(self,num_bits):
-        if self.reverse_all:
-            self.bits_io_obj.reverse(num_bits)
-        if self.invert_all:
-            self.bits_io_obj.invert(num_bits)
-        value,num_extracted = self.bits_io_obj.read(num_bits)
-        if num_extracted != num_bits:
-            raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
+        value = self._consume_bits(num_bits)
         all_ones = (1<<num_bits)-1
         if value != all_ones:
             raise OnesError('Token = %s; Expected all ones (%d); Extracted value = %d' % (self.tok,all_ones,value))
 
     def handle_mod(self,num_bits,modtype):
+        pos = self.bits_io_obj.tell()
         if modtype == ModType.REVERSE:
             self.bits_io_obj.reverse(num_bits)
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,num_bits))
         elif modtype == ModType.INVERT:
             self.bits_io_obj.invert(num_bits)
+            self.mod_operations.append((self.tok,ModType.INVERT,pos,0,num_bits))
         elif modtype == ModType.ENDIANSWAP:
-            pos = self.bits_io_obj.tell()
-            self.bits_io_obj.reverse(num_bits)
-            for i in range(0,num_bits,8):
-                self.bits_io_obj.reverse(8)
-                self.bits_io_obj.seek(8,SEEK_CUR)
-            self.bits_io_obj.seek(pos)
+            self._endianswap(num_bits)
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
 
     def handle_marker(self,bytes_literal):
+        orig_bytes_literal = bytes_literal
         pos = self.bits_io_obj.tell()
         if pos % 8 != 0:
             raise Exception('Marker operation must occur when bit seek position is a multiple of 8')
-
         if self.invert_all:
             bytes_literal = invert_bytes(bytes_literal)
         if self.reverse_all:
             bytes_literal = reverse_bytes(bytes_literal)
+        if self.endianswap_all:
+            bytes_literal = bytes_literal[::-1]
+
         m = bits_offset = self.bits_io_obj.find(bytes_literal)
-        num_bits = len(bytes_literal)*8
+        self.handle_nestopen()
+        self._insert_data(m) #insert m 
+        n = self._pull(m,None) #p<m>.! - will insert n
+        self.handle_nestclose()
+        marker = self._consume_bits(len(bytes_literal)*8,Encoding.BYTS) #skip past the marker itself, applying any needed mod_operations
+        if marker != orig_bytes_literal:
+            raise Exception('Marker scan consumption did not match expected bytes literal')
+        self.logger.debug('Scan for %s: offset = %d, pulled bits = %d' % (repr(orig_bytes_literal),m,n))
 
-        value = m
-        n = num_bits
-        self.stack_record[-1].append(value)
-        self.stack_data[-1].append(value)
-        self.last_value = value
-
-        self.flat_pattern.append('.')
-        self.flat_list.append(value)
-        self.flat_labels.append(None)
-        self.flat_pos += 1
-        self.last_index_stack = tuple(self.index_stack)
-        self.index_stack[-1] += 1
-
-        self.bits_io_obj.reverse(m+n)
-        self.bits_io_obj.reverse(n)
-        self.bits_io_obj.seek(n,SEEK_CUR)
-        self.bits_io_obj.reverse(m)
-        self.bits_io_obj.seek(pos+n)
 
     def handle_modoff(self,offset_bits,num_bits,modtype):
         pos = self.bits_io_obj.tell()
-        if num_bits is None:
-            L = len(self)
-            num_bits = L - offset_bits
-            self.stack_record[-1].append(num_bits)
-            self.stack_data[-1].append(num_bits)
-            self.last_value = num_bits
-
-            self.flat_pattern.append('.')
-            self.flat_list.append(num_bits)
-            self.flat_labels.append(None)
-            self.flat_pos += 1
-            self.last_index_stack = tuple(self.index_stack)
-            self.index_stack[-1] += 1
-
-
         if modtype == ModType.REVERSE:
+            if num_bits is None:
+                L = len(self.bits_io_obj)
+                num_bits = L - (pos+offset_bits)
+                self._insert_data(num_bits)
             self.bits_io_obj.seek(offset_bits,SEEK_CUR)
             self.bits_io_obj.reverse(num_bits)
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,offset_bits,num_bits))
         elif modtype == ModType.INVERT:
+            if num_bits is None:
+                L = len(self.bits_io_obj)
+                num_bits = L - (pos+offset_bits)
+                self._insert_data(num_bits)
             self.bits_io_obj.seek(offset_bits,SEEK_CUR)
             self.bits_io_obj.invert(num_bits)
+            self.mod_operations.append((self.tok,ModType.INVERT,pos,offset_bits,num_bits))
         elif modtype == ModType.PULL:
-            self.bits_io_obj.reverse(offset_bits+num_bits)
-            self.bits_io_obj.reverse(num_bits)
-            self.bits_io_obj.seek(num_bits,SEEK_CUR)
-            self.bits_io_obj.reverse(offset_bits)
+            self._pull(offset_bits,num_bits)
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
         self.bits_io_obj.seek(pos)
@@ -755,6 +895,16 @@ class Extractor(Tool):
                 self.invert_all = not self.invert_all
             else:
                 raise Exception('Token = %s; Invalid setting: %s' % (self.tok,repr(setting)))
+        elif modtype == ModType.ENDIANSWAP:
+            if setting == Setting.TRUE:
+                self.endianswap_all = True
+            elif setting == Setting.FALSE:
+                self.endianswap_all = False
+            elif setting == Setting.TOGGLE:
+                self.endianswap_all = not self.endianswap_all
+            else:
+                raise Exception('Token = %s; Invalid setting: %s' % (self.tok,repr(setting)))
+
         else:
             raise Exception('Token = %s; Invalid modtype: %s' % (self.tok,repr(modtype)))
 
@@ -779,16 +929,21 @@ class Extractor(Tool):
         new_record = []
         self.stack_record[-1].append(new_record) #embed new record into the previous record
         self.stack_record.append(new_record) #make the new record the active record being worked on
-        self.stack_extraction[-1].append(new_record) #embed new record into the previous record
-        self.stack_extraction.append(new_record) #make the new record the active record being worked on
+        new_record = []
+        self.stack_data[-1].append(new_record) #embed new record into the previous record
+        self.stack_data.append(new_record) #make the new record the active record being worked on
         self.flat_pattern.append('[')
         self.index_stack.append(0)
 
     def handle_nestclose(self):
-        if len(self.stack_record) == 0:
+        if len(self.stack_data) == 1:
             raise NestingError('there exists a "]" with no matching "["')
-        self.stack_record.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
-        self.stack_extraction.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
+        if len(self.stack_record) == 1:
+            self.data_record = [self.data_record] #expand out as if there were some [ in previous call
+            self.stack_record = [self.data_record]
+        else:
+            self.stack_record.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
+        self.stack_data.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
         self.flat_pattern.append(']')
         self.index_stack.pop(-1)
         self.index_stack[-1] += 1
@@ -796,6 +951,38 @@ class Extractor(Tool):
     def handle_assertion(self,value):
         if self.last_value != value:
             raise AssertionError('Token = %s; Expected value = %s; Extracted value = %s' % (self.tok,repr(value),repr(self.last_value)))
+
+
+    def handle_jump(self,num_bits,jump_type):
+        pos = self.tell()
+        L = len(self.bits_io_obj)
+        if jump_type in [JumpType.FORWARD,JumpType.BACKWARD]:
+            self.logger.debug('Jump relative pos -> orig = %d -> %d' % (pos,target_orig))
+            target_orig = self._translate_to_original(pos)
+        elif jump_type == JumpType.END:
+            self.logger.debug('Jump relative to end: %d' % L)
+            target_orig = L
+        else:
+            self.logger.debug('Jump relative to beginning')
+            target_orig = 0
+        if jump_type in [JumpType.START, JumpType.FORWARD]:
+            self.logger.debug('Jump forward offset: %d + %d = %d' % (target_orig,num_bits,target_orig+num_bits))
+            target_orig += num_bits
+
+        else:
+            self.logger.debug('Jump backward offset: %d - %d = %d' % (target_orig,num_bits,target_orig-num_bits))
+            target_orig -= num_bits
+
+        target = self._translate_from_original(target_orig)
+        self.logger.debug('Jump target translation: orig -> pos = %d -> %d' % (target_orig,target))
+        offset = target - pos
+        self.logger.debug('Jump actual buffer offset = %d - %d = %d' % (target,pos,offset))
+        if offset < 0:
+            raise Exception('Jump is to already parsed location: %s' % self.tok)
+        if offset > 0:
+            num_bits = L - (pos + offset)
+            self._pull(offset,num_bits)
+            self.logger.debug('Jump pull offset = %d, num_bits = %d' % (offset,num_bits))
 
 class Constructor(Tool):
     """
@@ -805,16 +992,21 @@ class Constructor(Tool):
         self.data_obj = data_obj
 
         #Simply flatten the data obj. The order of traversal is what is important, not the structure.
-        self.flat_list,self.flat_pattern = flatten(data_obj)
-        self.flat_labels = [None]*len(self.flat_list)
+        self.data_flat,self.flat_pattern = flatten(data_obj)
+        self.flat_labels = [None]*len(self.data_flat)
         self.flat_pos = 0
         self.index_stack = [0]
+
+        
+        #initialize settings
         self.reverse_all = False
         self.invert_all = False
+        self.endianswap_all = False
+        
         self.last_value = None
         self.last_index_stack = None
         self.bytes_io_obj = io.BytesIO()
-        self.bits_io_obj = bits_io.BitsIO(bytes_obj)
+        self.bits_io_obj = BitsIO(bytes_obj)
         self.labels = {}
 
     def __call__(self,pattern):
@@ -848,41 +1040,66 @@ class Constructor(Tool):
         #   operations can happen first without regard to mod operations happening, then performing all mod
         #   operations in reverse order to construct the original sequence of bits.
         pos = self.bits_io_obj.tell()
+        L = len(self.bits_io_obj)
         for tok,modtype,start,offset,num_bits in self.mod_operations[::-1]:
+            if num_bits is None:
+                num_bits = L - (start+offset)
+            if modtype == 'check_endian':
+                if num_bits % 8 != 0:
+                    raise Exception('Endian swap must be performed on a multiple of 8 bits: %s' % self.tok)
+                continue
             if modtype == ModType.REVERSE:
                 self.bits_io_obj.seek(start+offset)
                 self.bits_io_obj.reverse(num_bits)
             elif modtype == ModType.INVERT:
                 self.bits_io_obj.seek(start+offset)
                 self.bits_io_obj.invert(num_bits)
-            elif modtype == ModType.PULL:
-                #reverse order
-                self.bits_io_obj.seek(start+num_bits)
-                self.bits_io_obj.reverse(offset)
-                self.bits_io_obj.seek(start)
-                self.bits_io_obj.reverse(num_bits)
-                self.bits_io_obj.reverse(offset+num_bits)
             else:
                 raise Exception('Token = %s; Invalid modtype: %s' % (tok,repr(modtype)))
         self.bits_io_obj.seek(pos)
-            
-    def handle_value(self,num_bits,encoding):
-        value = self.flat_list[self.flat_pos]
+
+    def _pull(self,m,n):
+        if n is None:
+            n = self._consume_data()
+        pos = self.bits_io_obj.tell()
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,m+n))
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,n))
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,n,m))
+        return n
+
+    def _endianswap(self,n):
+        self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,n))
+        for i in range(0,num_bits,8):
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,i,8))
+        self.mod_operations.append((self.tok,'check_endian',pos,0,n)) #add at end, so that check happens first when mod_operations is processed backwards
+
+    def _consume_data(self,num_bits=None,encoding=Encoding.UINT):
+        value = self.data_flat[self.flat_pos]
         self.flat_pos += 1
         self.data_record.append(value)
         uint_value = uint_encode(value,num_bits,encoding)
-        pos = self.bits_io_obj.tell()
-        if self.reverse_all:
-            self.mod_operations.append(None,ModType.REVERSE,pos,0,num_bits)
-        if self.invert_all:
-            self.mod_operations.append(None,ModType.INVERT,pos,0,num_bits)
-        self.bits_io_obj.write(uint_value,num_bits)
         self.last_value = value
         self.last_index_stack = tuple(self.index_stack)
         self.index_stack[-1] += 1
+        return uint_value
+
+    def _insert_bits(self,uint_value,num_bits):
+        pos = self.bits_io_obj.tell()
+        if self.reverse_all:
+            self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,num_bits))
+        if self.invert_all:
+            self.mod_operations.append((self.tok,ModType.INVERT,pos,0,num_bits))
+        if self.endianswap_all:
+            self._endianswap(num_bits)
+        self.bits_io_obj.write(uint_value,num_bits)
+
+            
+    def handle_value(self,num_bits,encoding):
+        uint_value = self._consume_data(num_bits,encoding)
+        self._insert_bits(uint_value,num_bits)
 
     def handle_takeall(self):
-        first_byte_value,first_byte_bits,bytes_data = self.flat_list[self.flat_pos:self.flat_pos+3]
+        first_byte_value,first_byte_bits,bytes_data = self.data_flat[self.flat_pos:self.flat_pos+3]
         self.flat_pos += 3
         self.data_record.append([first_byte_value,first_byte_bits,bytes_data])
         pos = self.bits_io_obj.tell()
@@ -890,6 +1107,9 @@ class Constructor(Tool):
             self.mod_operations.append(None,ModType.REVERSE,pos,0,None)
         if self.invert_all:
             self.mod_operations.append(None,ModType.INVERT,pos,0,None)
+        if self.endianswap_all:
+            self._endianswap(None)
+
         self.bits_io_obj.write_bytes(bytes_data,first_byte_value,first_byte_bits)
         self.last_value = bytes_data
         self.last_index_stack = tuple(self.index_stack)
@@ -900,64 +1120,38 @@ class Constructor(Tool):
         self.bits_io_obj.write(0,num_bits)
 
     def handle_zeros(self,num_bits):
-        if self.reverse_all:
-            self.mod_operations.append(None,ModType.REVERSE,pos,0,num_bits)
-        if self.invert_all:
-            self.mod_operations.append(None,ModType.INVERT,pos,0,num_bits)
-
-        self.bits_io_obj.write(0,num_bits)
+        self._insert_bits(0,num_bits)
 
     def handle_ones(self,num_bits):
-        if self.reverse_all:
-            self.mod_operations.append(None,ModType.REVERSE,pos,0,num_bits)
-        if self.invert_all:
-            self.mod_operations.append(None,ModType.INVERT,pos,0,num_bits)
         all_ones = (1<<num_bits)-1
-        self.bits_io_obj.write(all_ones,num_bits)
+        self._insert_bits(all_ones,num_bits)
 
     def handle_mod(self,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
-        if modtype == ModType.REVERSE or modtype == ModType.INVERT:
+        if modtype == ModType.ENDIANSWAP:
+            self._endianswap(num_bits)
+        else:
             self.mod_operations.append((self.tok,mod_type,self.bits_io_obj.tell(),0,num_bits))
-        elif modtype == ModType.ENDIANSWAP:
-            #reverse order
-            pos = self.bits_io_obj.tell()
-            for i in range(0,num_bits,8)[::-1]:
-                self.mod_operations.append((self.tok,ModType.REVERSE,pos,i,8))
-            self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,num_bits))
 
     def handle_marker(self,bytes_literal):
         num_bits = len(bytes_literal)*8
-
-        offset_bits = self.flat_list[self.flat_pos]
-        self.flat_pos += 1
-        self.data_record.append(offset_bits)
-        self.last_value = offset_bits
-        self.last_index_stack = tuple(self.index_stack)
-        self.index_stack[-1] += 1
-
         pos = self.bits_io_obj.tell()
         if pos % 8 != 0:
-            raise Exception('Pull operation requires bit seek position to be a multiple of 8')
-        self.mod_operations.append((self.tok,ModType.PULL,pos,offset_bits,num_bits))
-        self.bits_io_obj.write(uint_encode(bytes_literal,num_bits,Encoding.BYTS),num_bits)
-        if self.reverse_all:
-            self.mod_operations.append(None,ModType.REVERSE,pos,0,num_bits)
-        if self.invert_all:
-            self.mod_operations.append(None,ModType.INVERT,pos,0,num_bits)
-            
+            raise Exception('Marker operation requires bit seek position to be a multiple of 8')
+        m = self._consume_data()
+        n = self._consume_data()
+        self._pull(m,n)
+        self._insert_bits(uint_encode(bytes_literal,num_bits,Encoding.BYTS),num_bits)
 
     def handle_modoff(self,offset_bits,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
         if num_bits is None: #for when ! is in token
-            num_bits = self.flat_list[self.flat_pos]
-            self.flat_pos += 1
-            self.data_record.append(num_bits)
-            self.last_value = num_bits
-            self.last_index_stack = tuple(self.index_stack)
-            self.index_stack[-1] += 1
+            num_bits = self._consume_data()
         pos = self.bits_io_obj.tell()
-        self.mod_operations.append((self.tok,mod_type,pos,offset_bits,num_bits))
+        if modtype == ModType.PULL:
+            self._pull(offset_bits,num_bits)
+        else:
+            self.mod_operations.append((self.tok,mod_type,pos,offset_bits,num_bits))
 
     def handle_modset(self,modtype,setting):
         if modtype == ModType.REVERSE:
@@ -976,6 +1170,15 @@ class Constructor(Tool):
                 self.invert_all = False
             elif setting == Setting.TOGGLE:
                 self.invert_all = not self.invert_all
+            else:
+                raise Exception('Token = %s; Invalid setting: %s' % (self.tok,repr(setting)))
+        elif modtype == ModType.ENDIANSWAP:
+            if setting == Setting.TRUE:
+                self.endianswap_all = True
+            elif setting == Setting.FALSE:
+                self.endianswap_all = False
+            elif setting == Setting.TOGGLE:
+                self.endianswap_all = not self.endianswap_all
             else:
                 raise Exception('Token = %s; Invalid setting: %s' % (self.tok,repr(setting)))
         else:
@@ -1002,9 +1205,11 @@ class Constructor(Tool):
         self.index_stack.append(0)
 
     def handle_nestclose(self):
-        if len(self.stack) == 0:
-            raise nestingerror('there exists a "]" with no matching "["')
-        self.stack.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
+        if len(self.stack) == 1:
+            self.data_record = [self.data_record] #expand out as if there were a [ in some previous call
+            self.stack = [self.data_record]
+        else:
+            self.stack.pop(-1) #stop modifying the current record and modify whatever one we were doing before it
         self.index_stack.pop(-1)
         self.index_stack[-1] += 1
 
@@ -1012,22 +1217,48 @@ class Constructor(Tool):
         if self.last_value != value:
             raise AssertionError('Token = %s; Expected value = %s; Extracted value = %s' % (self.tok,repr(value),repr(self.last_value)))
 
-def extract(blueprint_func,bytes_io_obj):
-    tool = Extractor(bytes_io_obj)
-    blueprint_func(tool)
-    tool.finalize()
-    return tool
+    def handle_jump(self,num_bits,jump_type):
+        pos = self.tell()
+        L = len(self.bits_io_obj)
+        if jump_type in [JumpType.FORWARD,JumpType.BACKWARD]:
+            target_orig = self._translate_to_original(pos)
+        elif jump_type == JumpType.END:
+            target_orig = L
+        else:
+            target_orig = 0
+        if jump_type in [JumpType.START, JumpType.FORWARD]:
+            target_orig += num_bits
+        else:
+            target_orig -= num_bits
+        target = self._translate_from_original(target_orig)
+        offset = target - pos
+        if offset < 0:
+            raise Exception('Jump is to already parsed location: %s' % self.tok)
+        if offset > 0:
+            self._pull(offset,None)
 
-def extract_data(blueprint_func,bytes_io_obj):
-    tool = extract(blueprint_func,bytes_io_obj)
+def extract(blueprint,bytes_io_obj):
+    tool = Extractor(bytes_io_obj)
+    if isinstance(blueprint,(bytes,str)):
+        result = tool(blueprint)
+    else:
+        result = blueprint(tool)
+    tool.finalize()
+    return tool, result
+
+def extract_data(blueprint,bytes_io_obj):
+    tool,result = extract(blueprint,bytes_io_obj)
     return tool.data_obj
 
-def construct(blueprint_func,data_obj):
+def construct(blueprint,data_obj):
     tool = Constructor(data_obj)
-    blueprint_func(tool)
+    if isinstance(blueprint,(bytes,str)):
+        result = tool(blueprint)
+    else:
+        result = blueprint(tool)
     tool.finalize()
-    return tool
+    return tool,result
 
-def construct_bytes(data_obj,blueprint_func):
-    tool = construct(blueprint_func,data_obj)
+def construct_bytes(data_obj,blueprint):
+    tool,result = construct(blueprint,data_obj)
     return bytes(tool)
