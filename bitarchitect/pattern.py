@@ -76,6 +76,8 @@ class ModType(Enum):
     INVERT=2
     ENDIANSWAP=3
     PULL=4
+    ENDIANCHECK=5 #not a transformation, but a placeholder for Constructor() to check that endian swap size is whole number of bytes
+
     
 
 class Setting(Enum):
@@ -487,15 +489,15 @@ def uint_encode(value,num_bits,encoding):
         else:
             return value + (1<<num_bits)
     elif encoding == Encoding.SPFP:
-        return bytes_to_uint(struct.pack('>f',value))
+        return bytes_to_uint(struct.pack('>f',value))[0]
     elif encoding == Encoding.DPFP:
-        return bytes_to_uint(struct.pack('>d',value))
+        return bytes_to_uint(struct.pack('>d',value))[0]
     elif encoding == Encoding.LHEX or encoding == Encoding.UHEX:
         return int(value,16)
     elif encoding == Encoding.BINS:
         return int(value,2)
     elif encoding == Encoding.BYTS:
-        return bytes_to_uint(value)
+        return bytes_to_uint(value)[0]
 
 class ZerosError(Exception):pass
 class OnesError(Exception):pass
@@ -644,7 +646,7 @@ class Tool():
             if modtype == ModType.REVERSE:
                 if mstart <= orig_pos <= mend:
                     orig_pos = mend - (orig_pos - mstart)
-            elif modtype == ModType.INVERT:
+            elif modtype == ModType.INVERT or modtype == ModType.ENDIANCHECK:
                 pass
             else:
                 raise Exception('Invalid modtype for _translate_to_original: %s' % modtype)
@@ -658,7 +660,7 @@ class Tool():
             if modtype == ModType.REVERSE:
                 if mstart <= pos <= mend:
                     pos = mend - (pos - mstart)
-            elif modtype == ModType.INVERT:
+            elif modtype == ModType.INVERT or modtype == ModType.ENDIANCHECK:
                 pass
             else:
                 raise Exception('Invalid modtype for _translate_to_original: %s' % modtype)
@@ -980,8 +982,8 @@ class Extractor(Tool):
         if offset < 0:
             raise Exception('Jump is to already parsed location: %s' % self.tok)
         if offset > 0:
-            num_bits = L - (pos + offset)
-            self._pull(offset,num_bits)
+            #num_bits = L - (pos + offset) #by providing a value, that makes it not get put into the data structure - it needs to be put into the data structure though
+            num_bits = self._pull(offset,None)
             self.logger.debug('Jump pull offset = %d, num_bits = %d' % (offset,num_bits))
 
 class Constructor(Tool):
@@ -1006,12 +1008,15 @@ class Constructor(Tool):
         self.last_value = None
         self.last_index_stack = None
         self.bytes_io_obj = io.BytesIO()
-        self.bits_io_obj = BitsIO(bytes_obj)
+        self.bits_io_obj = BitsIO(self.bytes_io_obj)
         self.labels = {}
+        self.mod_operations = []
+        self.logger = logarhythm.getLogger('Constructor')
+        self.logger.format = logarhythm.build_format(time=None,level=False)
 
     def __call__(self,pattern):
         self.data_record = []
-        self.stack = [data_record]
+        self.stack = [self.data_record]
         for instruction in pattern_parse(pattern):
             tok = instruction[0]
             self.tok = tok
@@ -1044,7 +1049,7 @@ class Constructor(Tool):
         for tok,modtype,start,offset,num_bits in self.mod_operations[::-1]:
             if num_bits is None:
                 num_bits = L - (start+offset)
-            if modtype == 'check_endian':
+            if modtype == ModType.ENDIANCHECK:
                 if num_bits % 8 != 0:
                     raise Exception('Endian swap must be performed on a multiple of 8 bits: %s' % self.tok)
                 continue
@@ -1060,7 +1065,7 @@ class Constructor(Tool):
 
     def _pull(self,m,n):
         if n is None:
-            n = self._consume_data()
+            n,_ = self._consume_data()
         pos = self.bits_io_obj.tell()
         self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,m+n))
         self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,n))
@@ -1068,20 +1073,21 @@ class Constructor(Tool):
         return n
 
     def _endianswap(self,n):
+        pos = self.tell()
         self.mod_operations.append((self.tok,ModType.REVERSE,pos,0,n))
-        for i in range(0,num_bits,8):
+        for i in range(0,n,8):
             self.mod_operations.append((self.tok,ModType.REVERSE,pos,i,8))
-        self.mod_operations.append((self.tok,'check_endian',pos,0,n)) #add at end, so that check happens first when mod_operations is processed backwards
+        self.mod_operations.append((self.tok,ModType.ENDIANCHECK,pos,0,n)) #add at end, so that check happens first when mod_operations is processed backwards
 
     def _consume_data(self,num_bits=None,encoding=Encoding.UINT):
         value = self.data_flat[self.flat_pos]
         self.flat_pos += 1
-        self.data_record.append(value)
+        self.stack[-1].append(value)
         uint_value = uint_encode(value,num_bits,encoding)
         self.last_value = value
         self.last_index_stack = tuple(self.index_stack)
         self.index_stack[-1] += 1
-        return uint_value
+        return uint_value,value
 
     def _insert_bits(self,uint_value,num_bits):
         pos = self.bits_io_obj.tell()
@@ -1095,13 +1101,14 @@ class Constructor(Tool):
 
             
     def handle_value(self,num_bits,encoding):
-        uint_value = self._consume_data(num_bits,encoding)
+        uint_value,value = self._consume_data(num_bits,encoding)
         self._insert_bits(uint_value,num_bits)
+        self.logger.debug('%s = %r' % (self.tok,value))
 
     def handle_takeall(self):
         first_byte_value,first_byte_bits,bytes_data = self.data_flat[self.flat_pos:self.flat_pos+3]
         self.flat_pos += 3
-        self.data_record.append([first_byte_value,first_byte_bits,bytes_data])
+        self.stack[-1].append([first_byte_value,first_byte_bits,bytes_data])
         pos = self.bits_io_obj.tell()
         if self.reverse_all:
             self.mod_operations.append(None,ModType.REVERSE,pos,0,None)
@@ -1138,15 +1145,18 @@ class Constructor(Tool):
         pos = self.bits_io_obj.tell()
         if pos % 8 != 0:
             raise Exception('Marker operation requires bit seek position to be a multiple of 8')
-        m = self._consume_data()
-        n = self._consume_data()
+        self.handle_nestopen()
+        m,_ = self._consume_data()
+        n,_ = self._consume_data()
+        self.handle_nestclose()
         self._pull(m,n)
         self._insert_bits(uint_encode(bytes_literal,num_bits,Encoding.BYTS),num_bits)
+        self.logger.debug('Scan for %s: offset = %d, pulled bits = %d' % (repr(bytes_literal),m,n))
 
     def handle_modoff(self,offset_bits,num_bits,modtype):
         #the bit stream does not fully exist yet, so store all reversals and inversions, then apply them at the end
         if num_bits is None: #for when ! is in token
-            num_bits = self._consume_data()
+            num_bits,_ = self._consume_data()
         pos = self.bits_io_obj.tell()
         if modtype == ModType.PULL:
             self._pull(offset_bits,num_bits)
@@ -1221,21 +1231,29 @@ class Constructor(Tool):
         pos = self.tell()
         L = len(self.bits_io_obj)
         if jump_type in [JumpType.FORWARD,JumpType.BACKWARD]:
+            self.logger.debug('Jump relative pos -> orig = %d -> %d' % (pos,target_orig))
             target_orig = self._translate_to_original(pos)
         elif jump_type == JumpType.END:
+            self.logger.debug('Jump relative to end: %d' % L)
             target_orig = L
         else:
+            self.logger.debug('Jump relative to beginning')
             target_orig = 0
         if jump_type in [JumpType.START, JumpType.FORWARD]:
+            self.logger.debug('Jump forward offset: %d + %d = %d' % (target_orig,num_bits,target_orig+num_bits))
             target_orig += num_bits
         else:
+            self.logger.debug('Jump backward offset: %d - %d = %d' % (target_orig,num_bits,target_orig-num_bits))
             target_orig -= num_bits
         target = self._translate_from_original(target_orig)
+        self.logger.debug('Jump target translation: orig -> pos = %d -> %d' % (target_orig,target))
         offset = target - pos
+        self.logger.debug('Jump actual buffer offset = %d - %d = %d' % (target,pos,offset))
         if offset < 0:
             raise Exception('Jump is to already parsed location: %s' % self.tok)
         if offset > 0:
             self._pull(offset,None)
+            self.logger.debug('Jump pull offset = %d, num_bits = %d' % (offset,num_bits))
 
 def extract(blueprint,bytes_io_obj):
     tool = Extractor(bytes_io_obj)

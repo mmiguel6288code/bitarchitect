@@ -35,11 +35,6 @@ def zip_file(tool):
     file_entries(tool,file_data,cd_offset)
     return file_data
 
-
-
-
-
-
 def eocd_record(tool):
     """
     Parses the EOCD record. Assumes the signature has already been removed (first 4 bytes).
@@ -232,7 +227,7 @@ class TestZipBlueprint(unittest.TestCase):
             print(tool.data_obj)
             modified = [(item if item != b'file1.txt' else b'file3.txt') for item in tool.data_flat]
 
-            modzipfilepath = os.path.join(tdir,'test.zip')
+            modzipfilepath = os.path.join(tdir,'modtest.zip')
             with open(modzipfilepath,'wb') as f:
                 tool,file_data = bitarchitect.construct(zip_file,modified)
                 f.write(bytes(tool))
@@ -245,6 +240,7 @@ if __name__ == '__main__':
     logger.level = logarhythm.DEBUG
     logarhythm.getLogger('parse_pattern').level = logarhythm.DEBUG
     logarhythm.getLogger('Extractor').level = logarhythm.DEBUG
+    logarhythm.getLogger('Constructor').level = logarhythm.DEBUG
 
     TestZipBlueprint().test_zip_extract()
     #unittest.main()

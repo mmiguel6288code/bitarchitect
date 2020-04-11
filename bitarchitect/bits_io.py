@@ -5,6 +5,7 @@ BytesIO except that reads, writes, seeks, and other common methods operator at t
 
 import io
 from math import log, floor, ceil
+from enum import Enum
 def min_bits_uint(uint):
     """
     This function calculates the minimum number of bits needed to represent a given unsigned integer value.
@@ -255,6 +256,9 @@ def uint_to_bytes(uint,num_bits=None,loffset=0,lvalue=0,rvalue=0,reverse=False,i
     #reverse the bytes
     return bytes(bytes_data[::-1])
 
+class ByteSourceType(Enum):
+    BUFFER = 1
+    SOURCE = 2
 
 class BitsIO(object):
 
@@ -290,39 +294,31 @@ class BitsIO(object):
     >>> bin(ord('h'))
     '0b1101000'
     """
-    def __init__(self,byte_source=None):
+    def __init__(self,byte_source=None,byte_source_type = ByteSourceType.BUFFER):
         """
-        This class may be initialized with either a bytes object or a file-like object.
-
-        If initialized with a bytes object, the bytes object will be wrapped in a BytesIO object to make a mutable copy. The mode property of the BitsIO object will be set to "rb+" and the seek position will be 0.
-
-        If initialized with a file-like object, the file object should be opened in binary mode. The mode property will be set to the mode of the file object if it exists, otherwise it will be "rb+". The seek position will correspond to the first bit (MSB) of the current byte of the file-like object.
         """
         self.original_byte_source = byte_source
-        #if provided None, create an empty BytesIO object
-        if byte_source is None:
-            self.byte_source = io.BytesIO()
-            self.mode = 'rb+'
-        #if provided a bytes object, wrap it in a BytesIO object to make a mutable copy
-        if isinstance(byte_source,(bytes,bytearray,memoryview)):
-            self.byte_source = io.BytesIO(byte_source)
-            self.mode = 'rb+'
-        elif isinstance(byte_source,(io.BufferedIOBase,io.BufferedRandom,io.BufferedReader,io.BytesIO)):
-            if hasattr(byte_source,'mode'):
-                if not 'b' in byte_source.mode:
-                    raise Exception('File-like object provided to BitsIO must be opened in binary mode i.e. must have "b": mode = %s' % byte_source.mode)
-                if not '+' in byte_source.mode:
-                    pos = byte_source.tell()
-                    byte_source.seek(0)
-                    self.byte_source = io.BytesIO(byte_source.read())
-                    self.byte_source.seek(pos)
-                    byte_source.seek(pos)
-                    self.mode = 'rb+'
-                else:
-                    self.byte_source = byte_source
-                    self.mode = byte_source.mode
+        self.byte_source_type = byte_source_type
+        if byte_source_type == ByteSourceType.BUFFER:
+            if byte_source is None:
+                self.byte_source = io.BytesIO()
+            elif isinstance(byte_source,(bytes,bytearray,memoryview)):
+                self.byte_source = io.BytesIO(byte_source)
+            elif isinstance(byte_source,(io.BufferedIOBase,io.BufferedRandom,io.BufferedReader,io.BytesIO)):
+                if hasattr(byte_source,'mode'):
+                    if not 'b' in byte_source.mode:
+                        raise Exception('File-like object provided to BitsIO must be opened in binary mode i.e. must have "b": mode = %s' % byte_source.mode)
+                pos = byte_source.tell()
+                byte_source.seek(0)
+                self.byte_source = io.BytesIO(byte_source.read())
+                self.byte_source.seek(pos)
+                byte_source.seek(pos)
             else:
-                self.mode = 'rb+'
+                raise Exception('Incompatible byte_source: %s' % repr(byte_source))
+
+        elif byte_source_type == ByteSourceType.SOURCE:
+            self.byte_source = byte_source
+
         else:
             raise Exception('Invalid object for BitsIO byte_source: %s' % repr(type(byte_source)))
         self.bit_seek_pos = self.byte_source.tell()*8
