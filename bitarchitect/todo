@@ -1,0 +1,66 @@
+Consistent documentation
+
+
+Unbounded value tokens:
+	Don't insert tuples - just raise an exception if not on a byte boundary
+
+Counts:
+	Count variable given as c<n>"<label>"
+	(1) String length
+		Extraction: Consume the amount specified in counter
+		Construction: Set count based on size of value from data stream
+		Notation:
+			B..."<count_label>"*1+0; #have times or divide; have plus or minus
+			C..."<count_label>"*1+0;
+
+	(2) Sublist size
+		Extraction: Repeatedly consume until sublist size meets count
+		Construction: Set count based on size of sublist (bits)
+		Notation:
+			[<optional_leading_pattern>{<repeating_subpattern>}..."<count_label>"*1+0; <optional_trailing_pattern>]
+
+	(3) Sublist count
+		Extraction: Repeat until sublist len matches count
+		Construction: Set count based on len of sublist
+			[<repeating_single_value_pattern>..."<count_label>"*1+0; ]
+Marker:
+	Leave marker as delimiter between swapped regions
+	Blueprint must explicitly parse out the marker when it gets to it
+
+	m^"<hex_literal>"
+	m$"<hex_literal>"
+
+Jump:
+	Leave zero-length field as delimiter between swapped regions.
+	Use left-half-closed interval convention for pulls:
+		Offset = [)
+		Count = [)
+		This means that zero-length field stays with the bits to its immediate right (included in count but not offset)
+	Blueprint must assign unique numeric label to each jump and terminate at zero-length field delimiter.
+
+	js<n>^<k>
+	j$<k>
+
+Context managers:
+	Nesting
+	Jumps
+	Markers
+
+Last value will be the entire record after a nestclose()
+
+Infinite repetition: {...}$
+
+String/Text parsing
+	Grab a line and split by regex delimiter
+	Grab a line and decode to unicode
+	Grab until regex and split by regex delimiter
+
+Turn off non-constructable exceptions
+	Non-constructable extraction operations:
+		Do markers and jumps without closing them
+		Jump to an already parsed area
+		Exit function without consuming entire set of bits
+Turn off non-extracable exceptions
+	Non-extractable construction operations:
+		None?
+	
