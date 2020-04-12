@@ -68,6 +68,12 @@ def from_b8(b):
     return bytes(result)
 
 def from_b2(b):
+    """
+    >>> from_b2(b'101')
+    b'\xa0'
+    """
+    if isinstance(b,str):
+        b = bytes(b)
     ascii_base = ord('0')
     val = 0
     result = []
@@ -76,9 +82,12 @@ def from_b2(b):
         if i % 8 == 7:
             result.append(val)
             val = 0
+    if i % 8 < 7:
+        val = (val<<(7-i))
+        result.append(val)
     return bytes(result)
     
-from_hex = lambda s: from_b16(s,True)
+from_hex = lambda s: from_b16(s if isinstance(s,bytes) else bytes(s),True)
 from_oct = from_b8
 from_bin = from_b2
 

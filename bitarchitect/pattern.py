@@ -2,19 +2,23 @@
 Key Ideas:
     ( 1) A byte stream is a sequence of bytes. May be an instance of bytes, bytearray, memoryview, BytesIO, file
     ( 2) A bit stream is a sequence of bits. An instance of bitarchitect.BitsIO. Every bit stream has an underlying buffer that is a byte stream.
-    ( 3) A data structure is a hierarchy i.e. a list of elements which are either values or other hierarchies (lists).
-    ( 4) A data stream is a sequence of python values. A data structure can be flattened into a data stream. Conversely, a data stream can be hierarchically rearranged into a data structure.
-    ( 5) Extraction is the process of interpreting a byte stream into a data structure. It is the inverse of construction.
-    ( 6) Construction is the process of building a byte stream from a data structure. It is the inverse of extraction.
-    ( 7) A blueprint is a series of common instructions that enable both extraction and construction according to a common interpretation of a binary file format specification.
-    ( 8) A parsing pattern is a string consisting of tokens that describe basic extraction and construction operations. 
-    ( 9) A token is a short string within a parsing pattern that has a primitive extraction operation interpretation as well as a complementary primitive construction operation interpretation. 
-    (10) A token class is a template representation of a set of tokens with the same purpose but different details (such as number of bits involved).
-    (11) A Maker implements the extraction/construction primitive instructions and other infrastructure to apply a blueprint. A Maker is either an Extractor or a Constructor.
-    (12) Bit seek position refers to the current point of reading/writing within a bit stream.
-    (13) The data stream index refers to the current point of insertion/referencing within a data stream.
+    ( 3) A binary format specification is an interpretation of a sequence of bits that divides its regions into fields with specific interpretations.
+    ( 4) A data structure is a hierarchy i.e. a list of elements which are either values or other hierarchies (lists).
+    ( 5) A data stream is a sequence of python values. A data structure can be flattened into a data stream. Conversely, a data stream can be hierarchically rearranged into a data structure.
+    ( 6) Extraction is the process of interpreting a byte stream into a data structure. It is the inverse of construction.
+    ( 7) Construction is the process of building a byte stream from a data structure. It is the inverse of extraction.
+    ( 8) A blueprint is a series of common instructions that enable both extraction and construction according to a common interpretation of a binary file format specification.
+    ( 9) A parsing pattern is a string consisting of tokens that describe basic extraction and construction operations. 
+    (10) A token is a short string within a parsing pattern that has a primitive extraction operation interpretation as well as a complementary primitive construction operation interpretation. 
+    (11) A token class is a template representation of a set of tokens with the same purpose but different details (such as number of bits involved).
+    (12) A Maker implements the extraction/construction primitive instructions and other infrastructure to apply a blueprint. A Maker is either an Extractor or a Constructor.
+    (13) Bit seek position refers to the current point of reading/writing within a bit stream.
+    (14) The data stream index refers to the current point of insertion/referencing within a data stream.
+    (15) A blueprint is extractable if it can be used with an Extractor.
+    (16) A blueprint is constructible if it can be used with a Constructor.
+    (17) A blueprint is bijective if it is both extractable and constructible
 
-The purpose of this module is to provide the tools needed to implement blueprints.
+The purpose of this module is to provide the tools needed to implement bijective blueprints.
 
 Simple blueprints can be defined as a single parsing pattern string that conforms to the bitarchitect pattern language.
 More complex blueprints are defined as a python functions. These may assert multiple parsing patterns in conjunction with python conditional branching and loops.
@@ -115,22 +119,27 @@ Extraction algorithm:
 
 Construction algorithm:
     Construction involves producing an empty bit stream buffer and starting with a populated data stream.
-    In the first pass through the tokens, modification operations are saved in order but not applied, whereas bit producing instructions result in writes to the buffer.
+    Modification operations in general are interpreted as applying forward from the seek position. Since the buffer is being constructed, there are no bits ahead of the seek position.
+    Thus, in the first pass through the tokens, modification operations are saved in order, along with the seek position at which they are each intended to be applied, but not actually applied, whereas bit producing instructions result in writes to the buffer.
     After the first pass, the buffer is the correct and final size, however the bits reflect data stream order and not the order in the file format specification.
-    Modification operations are performed in reverse to move the bits to the correct order according to the file format specification.
+    Modification operations are performed in reverse order to move the bits to the correct order according to the file format specification.
     The seek position is updated for each modification operation to be at the point that it was when that modification operation's token was first encountered.
+    For reversals and inversions, the construction operation is identical to the extraction operation because those operations are their own inverses. More complex operations are also given extraction and construction inverses which work as long as the pattern rules are followed.
         
 Token class Specification:
     Tokens in a parsing pattern correspond to directives that are interpreted differently depending on whether the maker is an Extractor or a Constructor.
 
     The following templating expressions are used in the token grammar provided below:
-        <n> = a positive integer number
-        <m> = a positive integer number
-    e.g. u<n> could be written in an actual pattern as u5 or u100.
 
     The following characters consistently follow the given themes. Knowing this can serve as a memory aid.
         ^ = Related to the beginning of something
         $ = Related to the end of something
+        <n> = A positive integer number representing the size of a field
+        <m> = A positive integer number representing a relative offset in the bit stream buffer
+        <k> = A positive integer representing an offset in the bit stream format specification
+        <i> = A positive integer representing an ID of some sort
+        <x> = Denotes a marker in the bit stream of some sort
+    e.g. u<n> could be written in an actual pattern as u5 or u100.
 
     Finite value tokens:
         Extractor context:
@@ -218,11 +227,13 @@ Token class Specification:
         o<n> = Represents a sequence of ones n bits long. Raises an exception if the extracted bits are not all ones.
         n<n> = The next n bits are don't cares that are skipped in extracting and will not raise any exceptions. In construction mode, this is equivlaent to z<n>.
 
-    Data structure nesting:
+    Sublisting (data structure hierarchy/nesting)
         In extraction mode, the following tokens determine the structure of the data structure and the structure of the record returned when maker() is called within a blueprint function.
         In construction mode, the tokens have no effect other than structuring the record returned when maker() is called within a blueprint function.
         [ = Start collecting items in a new sublist
         ] = End the current sublist
+
+        See the maker sublist() method for an alternative via a python context manager
 
     Labels assignment:
         #"<label>" = Associate the previously extracted/constructed value with the label specified between the double quotes. Label names can consist of any characters besides the double quote character.
@@ -239,85 +250,145 @@ Token class Specification:
     Comments:
         ##<any string> 
 
-    Pull:
+    Finite Pull:
         p<m>.<n> = Pulls the block of data offset that is forward by m bits and is length n to the current seek position. Equivalent to r<m+n> r<n> r<n>.<m>
-        p<m>.$ = Sets n to correspond to the remainder of the data following the m offset.
+
+        Pulls exchange the order of a selected region of bytes ahead of the seek position with the bytes between that region and the seek position. A pull with both offset and size explicitly specified is equivalent to three reversals:
+            p<m>.<n> = r<m+n> r<n> r<n>.<m>
+            The first reversal reverses m + n bits. 
+            The result is that the n region is now ahead of the m region, but both regions are themselves reversed.
+            The second reversal puts the n region in the correct order.
+            The third reversal puts the m region in the correct order.
+        Extraction context:
+            The region of bits that is offset forward from the seek position by m bits, and is n bits long, is pulled to the current seek position. The m bits that were originally between the seek position and the start of the pulled region are placed after the bits that are being pulled.
+            In this example, the seek position (denoted %) is at the end of the field labeled "s" below.
+                +-----+--------+------+----------+
+                |  s  %   m    |   n  |   e      |
+                +-----+--------+------+----------+
+            The fields "m" and "n" are <m> bits and <n> bits long respectively.
+            The extraction operation p.<m>.<n> results in the following:
+                +-----+------+--------+----------+
+                |  s  %   n  |    m   |   e      |
+                +-----+------+--------+----------+
+        Construction context:
+            Performs the same reversal operations as extraction but does these operations in reverse order i.e. r<n>.<m> r<n> r<m+n>
+            p<m>.<n> can be thought of as the same as extraction but the m and n inputs have switched roles: it pulls a region of bits that is offset forward by n, and which is m bits long to the current seek position.
+            In this example, the seek position (denoted %) is at the end of the field labeled "s" below.
+                +-----+------+--------+----------+
+                |  s  %   n  |    m   |   e      |
+                +-----+------+--------+----------+
+            The fields "m" and "n" are <m> bits and <n> bits long respectively.
+            The construction operation p.<m>.<n> results in the following:
+                +-----+--------+------+----------+
+                |  s  %   m    |   n  |   e      |
+                +-----+--------+------+----------+
+        A pull is a modification operation that
+
+    Unbounded Pull:
+        p<m>.$ = Same as p<m>.<n> except that n corresponds to the remainder of the bit stream data following the m offset.
             Equivalent to calculating the length from the current position to the end, L, and setting n = L-m, then performing p<m>.<n>. 
-            The const
-            If p<m>.<n> is equivalent to r<m+n> r<n> r<n>.<m>, then p<m>.$ is conceptually equivalent to r<L> r<L-m> r<L-m>.<m>
-                r<m+$> is just r$
-                r<n> is also r$ 
-            
-            Inserts the computed n value into the data structure, which is used for construction.
-        In construction mode, the reversal steps are performed in reverse, which effectively results in pushing the final result to the original location it is to be pulled from.
 
-    Jump:
-        These commands jump based on original bit position in the file. This is implemented as a pull p<m>.$ operation where m is calculated based on knowing the modification operations that have been performed.
-        For the relative commands jf and jb, the current buffer position is translated to the original file bit position by iterating through reversal operations in reverse.
-        The provided relative offset (jf = forward = positive offset, jb = backward = negative offset) is applied to the resulting position.
-        For js = start, an absolute original bit position relative to the start of the file is provided.
-        For je = end, an offset prior to the end of the file is provided.
-        In all cases, this target position is re-translated back to where it corresponds to in the current buffer, and the current buffer seek position is subtracted from that to produce a final relative offset value for m.
-        If m is negative, then this means the jump is to a bit that has already been parsed, and an exception will be raised.
-        If m is positive, then the p<m>.$ will be performed.
-        js<n> = Jump to a position corresponding to a forward offset of n relative to the start according to the original bit ordering of the file/bit stream
-        jf<n> = Jump to a position corresponding to a forward offset of n relative to the current position according to the original bit ordering of the file/bit stream
-        jb<n> = Jump to a position corresponding to a backward offset of n relative to the current position according to the original bit ordering of the file/bit stream
-        je<n> = Jump to a position corresponding to a backward offset of n relative to the end according to the original bit ordering of the file/bit stream
-
-    Marker:
-        In some cases, extractions require scanning the file for a particular byte pattern and parsing from that point on.
+            Extraction makes the top diagram become the bottom.
+            Construction makes the bottom diagram become the top.
+                +-----+--------+-----------------+
+                |  s  %   m    |        e        |
+                +-----+--------+-----------------+
+                +-----+-----------------+--------+
+                |  s  %         e       |    m   |
+                +-----+-----------------+--------+
+    Marker scan:
+        In some cases, extractions require scanning the file for a particular byte pattern and parsing from that point on. The scan token must be initiated at a byte boundary.
         This is accounted for in bitarchitect by using markers.
 
-        There are two related tokens:
-            m^"<hex_literal>" = Initiate scan for marker. Marker must be located at a byte boundary. The hex literal must correspond to a whole number of bytes. This token muts be followed in the pattern at some point by two marker consumptions for the same pattern.
-            m$"<hex_literal>" = Consume marker. Must be present once for every scan initiate.
+        m^"<x>" = Initiate scan for marker. Marker must be located at a byte boundary. <x> is a hex literal that must correspond to a whole number of bytes. Usage of this token requires a matching consume marker token in the pattern as well for the blueprint to be constructible.
+        m$"<x>" = Consume marker. Must be present once for every scan initiate.
 
-        The behavior of these tokens is explained below individually for extraction and constructions contexts.
-        Markers in Extraction:
+        Extraction context:
+
             Suppose the bit stream diagramed here is being parsed:
                 +-----+--------+-+------+
-                |  p  |   a    |x|   b  |
+                |  s  %   m    |x|   n  |
                 +-----+--------+-+------+
-            The left side of the diagram is the very first bit in the bit stream, while the right side is the very last bit.
-            The first p bits have been parsed, and the current seek position is at the line beteen <p> and <a>
-            The <a> sequence of bits that do not contain the <x> pattern at a byte boundary.
-            The <x> pattern follows <a> and is itself followed by <b>.
-            The <b> sequence of bits may or may not contain the <x> pattern.
 
             Running m^"x" at this point will result in the following transformation:
                 +-----+------+-+--------+
-                |  p  |   b  |x|   a    |
+                |  s  %   n  |x|   m    |
                 +-----+------+-+--------+
             This can be thought of as this:
                 1) The bit stream is scanned from the current position until the <x> marker pattern is found.
                 2) Everything after the marker pattern is pulled to the current seek position and before the marker pattern
                 3) Everything that used to be before the marker pattern after the current seek position is moved after the marker.
-            The markers must be consumed later in the stream with m$"<x>" or a non-constructable exception will be raised.
+            The marker must be consumed later in the stream with m$"<x>" or a non-constructable exception will be raised.
             This makes a sequence such as 'm^"FF" B!' a non-constructable sequence because the 'B!' token would consume the end markers.
 
-        Markers in Construction:
+        Construction context:
             In construction, the bit stream is at first fully constructed without any transformation operations applied.
-            When each marker end token m$"<x>" is processed, that marker pattern is inserted into the bit stream.
+            When the marker end token m$"<x>" is processed, that marker pattern is inserted into the bit stream.
             Transformation operations are evaluated in reverse to reorganize the bit stream into the final desired bit structure matching the format specification.
             Suppose the bit stream has been constructed and is in the process of being transformed according to the marker start directive.
             The bit stream looks like this:
                 +-----+------+-+--------+
-                |  p  |   b  |x|   a    |
+                |  s  %   n  |x|   m    |
                 +-----+------+-+--------+
 
-            The marker start directive position is at the point between <p> and <b>.
-            The <a> sequence does not have the <x> pattern in it. If it did, redefine <a> to be everything to the right of the right-most marker pattern. 
+            The <m> sequence does not have the <x> pattern in it. If it did, redefine <m> to be everything to the right of the right-most marker pattern. 
             To execute the marker start directive:
                 1) The bytestream is searched from right to left to look for the right-most occurrence of the <x> pattern.
                 2) Everything to the right of the marker is swapped with everything to the left of the marker up to the bit seek position.
 
-    Counts:
+        See the maker marker() method for an alternative via a python context manager
 
-    Marker context managers:
-        Nesting
-        Marker
-        Jump
+
+    Absolute Jump:
+        js<k>^<i> = Jump to an offset <k> after the start of the format specification. This jump is numerically labeled with label <i>.
+        je<k>^<i> = Jump to an offset <k> before the end of the format specification. This jump is numerically labeled with label <i>.
+        j$<i> = The end-jump marker associated with jump label <i> (explanation below).
+
+        A jump is equivalent to an unbounded pull, except the offset provided is not interpreted as a bit stream buffer offset, but is instead an offset in terms of the bit stream format specification (i.e. the original bit stream for extraction, or the final bit stream for construction). 
+        The provided offset in the jump token is called the format specification offset.
+        This is translated into a buffer offset relative to the current seek position.
+        Extraction context:
+            In extraction context, this translation is based on applying all preceding modification operations to the target format specification position. In extraction context, all preceding modifications have been applied and are known.
+            If the resulting buffer offset is positive, then the selected position is ahead in the buffer and is valid. If the resulting buffer offset is negative, then the selected position is a position that has already been extracted in extraction context. This would allow an extraction to consume the same bits multiple times would produce a data stream incompatible with the construction algorithm since the construction algorithm would not know which parameters need to overwrite the bits that previous parameters were used to write. Thus a negative buffer offset will result in a non-constructible exception.
+
+        Construction context:
+            In construction context, preceding modifications have not yet been applied and are applied in reverse order (meaning after the current jump is applied). Preceding modifications that depend on successfully transforming data according to subsequent modifications (such as markers or other jumps) cannot be evaluated in order to evaluate the current jump operation. A separate approach with additional information is required to make this operation constructible. This information cannot be part of the bit stream because format specifications are typically fixed by external organizations. It should not be part of the data stream because it introduces an data interdependency that is difficult to get right that every user of the blueprint for construction will need to deal with. The additional information must therefore come from the blueprint itself.
+            The construction jump problem involves determining how to transform the bottom diagram below into the top diagram when neither e or m are known by providing additional information in the blueprint that is intuitively natural for the blueprint author to conceptualize as part of the extration process.
+                +-----+--------+-----------------+
+                |  s  %   m    |        e        |
+                +-----+--------+-----------------+
+                +-----+-----------------+--------+
+                |  s  %         e       |    m   |
+                +-----+-----------------+--------+
+        The solution is for the blueprint author to apply the jump as normal in extraction, but to treat the boundary between "e" and "m" in the bottom diagram as having a special jump-related bit marker "x" that needs to be consumed with a special token. This token should be treated as if it really exists in the bit stream. It should be considered to have zero-length. If subject to transformations from reversals, pulls, markers, other jumps, etc, this zero-length marker stays attached to the real bit to its direct right.
+                +-----+--------+-----------------+
+                |  s  %   m    |        e        |
+                +-----+--------+-----------------+
+                +-----+----------------+-+--------+
+                |  s  %         e      |x|    m   |
+                +-----+----------------+-+--------+
+        This end marker must be unambiguously associated with the current jump so that the end markers for two different jumps each be associated with the correct jump.
+        The operation above in its simplest can be treated as:
+            js<k>^0 u<e> j$0 u<m>
+        It is fine for the jump marker to be translated to different areas, it just needs to be consumed when it is reached.
+
+        See the maker jump() method for an alternative via a python context manager
+
+    Relative Jumps:
+        Relative jumps are similar to absolute jumps except that instead of offset <k> being from the absolute start or end of the format specification, this offset is interpreted from the current seek position translated to the corresponding current format specification position.
+
+        jf<k>^<i> = Move forward in the format specification by <k> bits relative to the current seek position as evaluated from the format specification. Label this as jump <i>.
+        jb<k>^<i> = Move backwards in the format specification by <k> bits relative to the current seek position as evaluated from the format specification. Label this as jump <i>.
+        j$<i> = Jump marker terminator (same as for absolute jump)
+
+        Extraction Context:
+            The current buffer seek position is translated to a position in the format specification by applying all preceding reversal operations in reverse order. The offset <k> is either added or subtracted to this position, and the resulting offset is re-translated back to a buffer position and a relative buffer offset <m> is calculated. The subsequent processing is the same as for an absolute jump.
+        Construction Context:
+            The processing is identical to an absolute jump and relies soley on the blueprint author inserting the end jump marker correctly.
+
+        See the maker jump() method for an alternative via a python context manager
+
+    Counts:
 
 """
 import re, ast, io, struct
@@ -406,6 +477,7 @@ def pattern_parse(pattern):
     space_equals_parse = re.compile('\\s*=')
     expr_parse = re.compile('([^;]+);')
     num_parse = re.compile('\\d+')
+    num_inf_parse = re.compile('\\d+|\\$')
     comment_parse = re.compile('.*?$',re.S|re.M)
     hex_parse = re.compile('([A-F0-9a-f]+)\"')
 
@@ -548,10 +620,13 @@ def pattern_parse(pattern):
         elif tok == '}': #REPETITION CAPTURE END
             logger.debug('Ending "}" repetition level %d' % len(repetition_stack))
             repetition_capture = repetition_stack.pop(-1)
-            num_match = num_parse.match(pattern,pos) #collect number
-            tok += num_match.group(0)
-            pos = num_match.end(0)
-            repetition_capture[0] = int(num_match.group(0)) #population first element with repetition number
+            num_inf_match = num_inf_parse.match(pattern,pos) #collect number
+            tok += num_inf_match.group(0)
+            pos = num_inf_match.end(0)
+            if num_inf_match.group(0) == '$':
+                repetition_capture[0] = float('inf')
+            else:
+                repetition_capture[0] = int(num_inf_match.group(0)) #population first element with repetition number
             if len(repetition_stack) == 0: #if all repetitions are done
                 yield from _process_repetition_capture(repetition_capture,logger)
         elif tok == '##': #COMMENT
@@ -561,14 +636,15 @@ def pattern_parse(pattern):
             logger.debug('Comment: %s' % tok)
         elif tok.startswith('m'): 
             if tok[1] == '^': #MARKERSTART
-                hexmatch = hex_parse.match(pattern,pos)
-                tok += hexmatch.group(0)
-                pos = hexmatch.end(0)
-                hex_literal = hexmatch.group(1)
-                byte_literal = b16decode(hex_literal,True)
-                instruction = (tok,Directive.MARKER,byte_literal)
+                directive = Directive.MARKERSTART
             elif tok[1] == '$': #MARKEREND
-            else:
+                directive = Directive.MARKEREND
+            hexmatch = hex_parse.match(pattern,pos)
+            tok += hexmatch.group(0)
+            pos = hexmatch.end(0)
+            hex_literal = hexmatch.group(1)
+            byte_literal = b16decode(hex_literal,True)
+            instruction = (tok,directive,byte_literal)
         elif code == 'j':
             code2 = tok[1]
             num_bits = int(tok[2:])
@@ -592,13 +668,24 @@ def pattern_parse(pattern):
     logger.debug('pattern completed')
 def _process_repetition_capture(repetition_capture,logger):
     count = repetition_capture[0]
-    for iteration in range(count):
-        for item in repetition_capture[1:]:
-            if isinstance(item,list):
-                yield from _process_repetition_capture(item,logger)
-            else:
-                logger.debug('repetition %d yield %s' % (iteration+1,repr(item)))
-                yield item
+    if count == float('inf'):
+        iteration = 0
+        while True:
+            for item in repetition_capture[1:]:
+                if isinstance(item,list):
+                    yield from _process_repetition_capture(item,logger)
+                else:
+                    logger.debug('repetition %d yield %s' % (iteration+1,repr(item)))
+                    yield item
+            iteration += 1
+    else:
+        for iteration in range(count):
+            for item in repetition_capture[1:]:
+                if isinstance(item,list):
+                    yield from _process_repetition_capture(item,logger)
+                else:
+                    logger.debug('repetition %d yield %s' % (iteration+1,repr(item)))
+                    yield item
 
 def uint_decode(uint_value,num_bits,encoding):
     """
@@ -646,52 +733,29 @@ def uint_encode(value,num_bits,encoding):
 
     >>> uint_encode('000101',6,Encoding.BINS)
     5
+
     >>> uint_decode(5,6,Encoding.BINS)
     '000101'
+
     >>> ord('A')
     65
     >>> uint_decode(65,8,Encoding.BYTS)
     b'A'
+
     >>> import struct, math
-    >>> from formats import to_hex
+    >>> from .formats import to_hex
     >>> to_hex(struct.pack('>f',math.pi))
     b'40490fdb'
-    >>> '%08x' % uint_encode(math.pi,32,Encoding.SPFP)[0]
+    >>> '%08x' % uint_encode(math.pi,32,Encoding.SPFP)
     '40490fdb'
-
-    >>> 
     >>> import struct, math
-    >>> from formats import to_hex
+    >>> from .formats import to_hex
     >>> to_hex(struct.pack('>d',math.pi))
     b'400921fb54442d18'
     >>> '%08x' % uint_encode(math.pi,64,Encoding.DPFP)
-    Traceback (most recent call last):
-      File "<console>", line 1, in <module>
-    TypeError: not all arguments converted during string formatting
-    >>> '%08x' % uint_encode(math.pi,64,Encoding.DPFP)[0]
     '400921fb54442d18'
-    >>> Encoding
-    <enum 'Encoding'>
-    >>> dir(Encoding)
-    ['BINS', 'BYTS', 'DPFP', 'LHEX', 'SINT', 'SPFP', 'UHEX', 'UINT', '__class__', '__doc__', '__members__', '__module__']
-    >>> uint_encode(777,Encoding.BINS)
-    Traceback (most recent call last):
-      File "<console>", line 1, in <module>
-    TypeError: uint_encode() missing 1 required positional argument: 'encoding'
-    >>> uint_encode(777,32,Encoding.BINS)
-    Traceback (most recent call last):
-      File "<console>", line 1, in <module>
-      File "/storage/emulated/0/Code/bitweaver/bitweaver/pattern.py", line 390, in uint_encode
-        return int(value,2)
-    TypeError: int() can't convert non-string with explicit base
     >>> uint_encode('110010100101',32,Encoding.BINS)
     3237
-    >>> uint_encode('111111',6,Encoding.SINT)
-    Traceback (most recent call last):
-      File "<console>", line 1, in <module>
-      File "/storage/emulated/0/Code/bitweaver/bitweaver/pattern.py", line 379, in uint_encode
-        if value >= 0:
-    TypeError: '>=' not supported between instances of 'str' and 'int'
     >>> uint_encode(-1,6,Encoding.SINT)
     63
     """
@@ -705,7 +769,8 @@ def uint_encode(value,num_bits,encoding):
     elif encoding == Encoding.SPFP:
         return bytes_to_uint(struct.pack('>f',value))[0]
     elif encoding == Encoding.DPFP:
-        return bytes_to_uint(struct.pack('>d',value))[0]
+        result = bytes_to_uint(struct.pack('>d',value))[0]
+        return result
     elif encoding == Encoding.LHEX or encoding == Encoding.UHEX:
         return int(value,16)
     elif encoding == Encoding.BINS:
@@ -727,87 +792,118 @@ def flatten(data_structure):
     >>> flatten([1,'abc',[0,[1,1,[5]],'def'],9,10,11])
     ([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '..[.[..[.]].]...')
     """
-    flat_list = []
-    flat_pattern = []
+    data_stream = []
+    structure_pattern = []
     stack = [[data_structure,0]]
     while len(stack) > 0:
         target,pos = stack[-1]
         if pos >= len(target):
             stack.pop(-1)
-            flat_pattern.append(']')
+            structure_pattern.append(']')
         else:
             item = target[pos]
             stack[-1][1] += 1
             if isinstance(item,(list,tuple)):
                 stack.append([item,0])
-                flat_pattern.append('[')
+                structure_pattern.append('[')
             else:
-                flat_list.append(item)
-                flat_pattern.append('.')
-    flat_pattern.pop(-1)
-    return flat_list,''.join(flat_pattern)
-def deflatten(flat_pattern,flat_list):
+                data_stream.append(item)
+                structure_pattern.append('.')
+    structure_pattern.pop(-1) #remove trailing ]
+    return data_stream,''.join(structure_pattern)
+def deflatten(structure_pattern,data_stream):
     """
-    The deflatten function takes a flat data structure (list of values) and a flatten pattern, and produces a nested data structure according to those inputs.
+    The deflatten function takes a structure pattern flat and a data stream (list of values), and produces a nested data structure according to those inputs.
     This is the inverse function of flatten()
-    >>> deflatten([1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11], '..[.[..[.]].]...')
+    >>> deflatten('..[.[..[.]].]...',[1, 'abc', 0, 1, 1, 5, 'def', 9, 10, 11])
     [1, 'abc', [0, [1, 1, [5]], 'def'], 9, 10, 11]
     """
     data_structure = []
     stack = [data_structure]
     pos = 0
-    for token in flat_pattern:
+    for token in structure_pattern:
         if token == '[':
-            new_record = []
-            stack[-1].append(new_record)
-            stack.append(new_record)
+            new_sublist = []
+            stack[-1].append(new_sublist)
+            stack.append(new_sublist)
         elif token == ']':
             stack.pop(-1)
         elif token == '.':
-            stack[-1].append(flat_list[pos])
+            stack[-1].append(data_stream[pos])
             pos += 1
     return data_structure
-def get_flat_index(flat_pattern,nested_indices):
-    nested_indices = list(nested_indices)
-    cumulative_index = 0
-    index_stack = [0]
-    target_index = nested_indices.pop(0)
-    last_index = len(nested_indices) == 0
-    skip_level = None
-    for p in flat_pattern:
-        if p == '[':
-            if not last_index and target_index == index_stack[-1]:
-                target_index = nested_indices.pop(0)
-                last_index = len(nested_indices) == 0
-            else:
-                skip_level = len(index_stack)
-            index_stack.append(0)
-        elif p == '.':
-            if last_index and target_index == index_stack[-1]:
-                return cumulative_index
-            index_stack[-1] += 1
-            cumulative_index += 1
-        elif p == ']':
-            index_stack.pop(-1)
-            index_stack[-1] += 1
-            if skip_level is not None and len(index_stack) == skip_level:
-                skip_level = None
-        
-def get_nested_indices(flat_pattern,flat_index):
-    index_stack = [0]
-    cumulative_index = 0
-    for p in flat_pattern:
-        if p == '[':
-            index_stack.append(0)
-        elif p == '.':
-            if cumulative_index == flat_index:
-                return index_stack
-            index_stack[-1] += 1
-        elif p == ']':
-            index_stack.pop(-1)
-            index_stack[-1] += 1
 
+def get_stream_index(structure_pattern,structure_index):
+    """
+    Translates the sequence of indices identifying an item  in a hierarchy
+    to the index identifying the same item in the flattened data stream.
+    The structure indices must point to a value, not a list.
+    >>> get_stream_index('..[[[.]..].].',[0])
+    0
+    >>> get_stream_index('..[[[.]..].].',[2,0,0,0])
+    2
+    >>> get_stream_index('..[[[.]..].].',[2,1])
+    5
+    """
+    structure_index = list(structure_index)
+    stream_index = 0 
+    current_structure_index  = [0] 
+    for p in structure_pattern:
+        if p == '[':
+            if current_structure_index >= structure_index:
+                raise Exception('Provided structure_index does not point to a non-list element')
+            current_structure_index.append(0)
+        elif p == ']':
+            if current_structure_index >= structure_index:
+                raise Exception('Provided structure_index does not point to a non-list element')
+            current_structure_index.pop(-1)
+            current_structure_index[-1] += 1
+        elif p == '.':
+            if current_structure_index == structure_index:
+                return stream_index
+            stream_index += 1
+            current_structure_index[-1] += 1
+        else:
+            raise Exception('Invalid character in structure pattern: %s' % repr(p))
 
+def get_structure_index(structure_pattern,stream_index):
+    """
+    Translates the stream index into a sequence of structure indices identifying an item in a hierarchy whose structure is specified by the provided structure pattern.
+    >>> get_structure_index('...',1)
+    [1]
+    >>> get_structure_index('.[.].',1)
+    [1, 0]
+    >>> get_structure_index('.[[...],..].',1)
+    [1, 0, 0]
+    >>> get_structure_index('.[[...]...].',2)
+    [1, 0, 1]
+    >>> get_structure_index('.[[...]...].',3)
+    [1, 0, 2]
+    >>> get_structure_index('.[[...]...].',4)
+    [1, 1]
+    >>> get_structure_index('.[[...]...].',5)
+    [1, 2]
+    >>> get_structure_index('.[[...]...].',6)
+    [1, 3]
+    >>> get_structure_index('.[[...]...].',7)
+    [2]
+    """
+    structure_index = [0]
+    current_stream_index = 0
+    for p in structure_pattern:
+        if p == '[':
+            structure_index.append(0)
+        elif p == '.':
+            if current_stream_index == stream_index:
+                return structure_index
+            structure_index[-1] += 1
+            current_stream_index += 1
+        elif p == ']':
+            structure_index.pop(-1)
+            structure_index[-1] += 1
+        else:
+            raise Exception('Invalid character in structure pattern: %s' % repr(p))
+    raise Exception('Provided stream index does not exist in the provided structure pattern')
 
 class Maker():
     """
@@ -835,15 +931,13 @@ class Maker():
         del self.labels[label]
 
     def tell_buffer(self):
-        return self.tell_buffer()
+        return self.bit_stream.tell()
     def tell_stream(self):
         return self._translate_to_original(self.tell())
     def index_structure(self):
         return list(self.index_stack)
     def index_stream(self):
         return self.flat_pos
-
-
     def finalize(self):
         raise NotImplementedError
 
@@ -947,6 +1041,7 @@ class Extractor(Maker):
         self._apply_settings(num_bits,encoding)
         uint_value,num_extracted = self.bit_stream.read(num_bits)
         if num_extracted != num_bits:
+            import pdb; pdb.set_trace()
             raise IncompleteDataError('Token = %s; Expected bits = %d; Extracted bits = %d' % (self.tok,num_bits,num_extracted))
         value = uint_decode(uint_value,num_bits,encoding)
         return value
@@ -1009,14 +1104,17 @@ class Extractor(Maker):
         return value
 
     def handle_takeall(self,encoding):
+        pos = self.tell_buffer()
+        if pos % 8 != 0:
+            raise Exception('%s requires the bit seek position to be on a byte boundary' % self.tok)
         L = len(self.bit_stream)
         num_bits = L - self.tell_buffer()
         self._apply_settings(num_bits,encoding)
 
         bytes_data,first_byte_value,first_byte_bits = self.bit_stream.read_bytes()
-        values = [first_byte_value,first_byte_bits,bytes_data]
-        self._insert_record(values)
-        return values
+        value = bytes_data
+        self._insert_data(value)
+        return value
 
     def handle_next(self,num_bits):
         self.bit_stream.seek(num_bits,SEEK_CUR) #these bits are don't cares
@@ -1154,6 +1252,7 @@ class Extractor(Maker):
     def handle_nestclose(self):
         if len(self.stack_data) == 1:
             raise NestingError('there exists a "]" with no matching "["')
+        self.last_value = self.stack_record[-1]
         if len(self.stack_record) == 1:
             self.data_record = [self.data_record] #expand out as if there were some [ in previous call
             self.stack_record = [self.data_record]
@@ -1324,16 +1423,15 @@ class Constructor(Maker):
         self.logger.debug('%s = %r' % (self.tok,value))
 
     def handle_takeall(self,encoding):
-        first_byte_value,first_byte_bits,bytes_data = self.data_stream[self.flat_pos:self.flat_pos+3]
-        self.flat_pos += 3
-        self.stack[-1].append([first_byte_value,first_byte_bits,bytes_data])
-        pos = self.tell_buffer()
-        self._apply_settings(None,encoding)
-
-        self.bit_stream.write_bytes(bytes_data,first_byte_value,first_byte_bits)
+        first_byte_value,first_byte_bits,bytes_data = self.data_stream[self.flat_pos]
+        self.flat_pos += 1
+        self.stack[-1].append(bytes_data)
         self.last_value = bytes_data
         self.last_index_stack = tuple(self.index_stack)
         self.index_stack[-1] += 1
+        pos = self.tell_buffer()
+        self._apply_settings(None,encoding)
+        self.bit_stream.write_bytes(bytes_data,first_byte_value,first_byte_bits)
 
     def handle_next(self,num_bits):
         #bits are don't care - no reversals or inversions
@@ -1428,6 +1526,7 @@ class Constructor(Maker):
         self.index_stack.append(0)
 
     def handle_nestclose(self):
+        self.last_value = self.stack[-1]
         if len(self.stack) == 1:
             self.data_record = [self.data_record] #expand out as if there were a [ in some previous call
             self.stack = [self.data_record]
