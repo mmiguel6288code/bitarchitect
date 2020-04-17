@@ -1,7 +1,7 @@
 from io import open
 from setuptools import find_packages, setup
 
-with open('bitarchitect/__init__.py', 'r') as f:
+with open('src/bitarchitect/__init__.py', 'r') as f:
     for line in f:
         if line.startswith('__version__'):
             version = line.strip().split('=')[1].strip(' \'"')
@@ -40,5 +40,5 @@ setup(
 
     install_requires=REQUIRES,
     tests_require=[],
-    packages=find_packages(),
+    packages=find_packages('src'),
 )
